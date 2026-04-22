@@ -29,7 +29,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 pub use crate::cli::CatShowDownloaderArgs;
 use crate::media_resolver::MediaType;
-use crate::models::{DownloadParams, SubtitleMode};
+use crate::models::{DownloadParams, MissingSubtitlePolicy, SubtitleMode};
 
 /// A [`MakeWriter`] implementation that routes output through [`MultiProgress::println`].
 ///
@@ -90,6 +90,28 @@ impl Drop for MultiProgressLineWriter {
     }
 }
 
+fn resolve_subtitle_settings(
+    skip_subtitles: bool,
+    allow_missing_subtitles: bool,
+    ffmpeg_available: bool,
+) -> (SubtitleMode, MissingSubtitlePolicy) {
+    let subtitle_mode = if skip_subtitles {
+        SubtitleMode::Skip
+    } else if ffmpeg_available {
+        SubtitleMode::Embed
+    } else {
+        SubtitleMode::Download
+    };
+
+    let missing_subtitle_policy = if allow_missing_subtitles {
+        MissingSubtitlePolicy::AllowMissing
+    } else {
+        MissingSubtitlePolicy::Strict
+    };
+
+    (subtitle_mode, missing_subtitle_policy)
+}
+
 /// Runs the main application logic.
 ///
 /// Resolves the provided slug as a TV show or movie, determines subtitle
@@ -128,15 +150,17 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
     let http_client = http_client::http_client();
     let media = media_resolver::get_media_id(&args.slug).await?;
 
-    let subtitle_mode = if args.skip_subtitles {
-        SubtitleMode::Skip
-    } else if ffmpeg_available {
+    let (subtitle_mode, missing_subtitle_policy) = resolve_subtitle_settings(
+        args.skip_subtitles,
+        args.allow_missing_subtitles,
+        ffmpeg_available,
+    );
+
+    if subtitle_mode == SubtitleMode::Embed {
         info!("ffmpeg detected, subtitles will be embedded into video files");
-        SubtitleMode::Embed
-    } else {
+    } else if subtitle_mode == SubtitleMode::Download {
         warn!("ffmpeg not found, subtitles will be downloaded as separate .vtt files");
-        SubtitleMode::Download
-    };
+    }
 
     if yt_dlp_available {
         info!("yt-dlp detected, using it as the download backend");
@@ -145,6 +169,7 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
     let params = DownloadParams {
         http_client,
         subtitle_mode,
+        missing_subtitle_policy,
         concurrent_downloads: args.concurrent_downloads,
         multi_progress,
         directory: Arc::from(args.directory.as_str()),
@@ -157,4 +182,18 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
     };
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_subtitle_settings;
+    use crate::models::{MissingSubtitlePolicy, SubtitleMode};
+
+    #[test]
+    fn test_should_prioritize_skip_subtitles_over_allow_missing_subtitles() {
+        let (subtitle_mode, missing_subtitle_policy) = resolve_subtitle_settings(true, true, true);
+
+        assert_eq!(subtitle_mode, SubtitleMode::Skip);
+        assert_eq!(missing_subtitle_policy, MissingSubtitlePolicy::AllowMissing);
+    }
 }

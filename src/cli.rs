@@ -25,6 +25,10 @@ pub struct CatShowDownloaderArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) skip_subtitles: bool,
 
+    /// Continue downloading when subtitles are unavailable
+    #[arg(long, default_value_t = false)]
+    pub(crate) allow_missing_subtitles: bool,
+
     /// Fix (clean) previously downloaded subtitle files in the directory
     #[arg(short, long, default_value_t = false)]
     pub(crate) fix_existing_subtitles: bool,
@@ -32,4 +36,37 @@ pub struct CatShowDownloaderArgs {
     /// Clean and embed existing subtitle files into their matching video files (requires ffmpeg)
     #[arg(long, default_value_t = false)]
     pub(crate) embed_existing_subtitles: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::CatShowDownloaderArgs;
+
+    #[test]
+    fn test_should_parse_allow_missing_subtitles_flag() {
+        let args = CatShowDownloaderArgs::parse_from([
+            "cat_show_downloader",
+            "bola-de-drac",
+            "--directory",
+            "output",
+            "--allow-missing-subtitles",
+        ]);
+
+        assert!(args.allow_missing_subtitles);
+        assert!(!args.skip_subtitles);
+    }
+
+    #[test]
+    fn test_should_default_to_strict_missing_subtitles_policy() {
+        let args = CatShowDownloaderArgs::parse_from([
+            "cat_show_downloader",
+            "bola-de-drac",
+            "--directory",
+            "output",
+        ]);
+
+        assert!(!args.allow_missing_subtitles);
+    }
 }

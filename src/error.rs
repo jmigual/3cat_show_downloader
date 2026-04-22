@@ -28,7 +28,7 @@ pub enum Error {
 
     /// Subtitles were requested but the episode does not provide any.
     #[error(
-        "no subtitles available for \"{0}\" — use --skip-subtitles to download without subtitles"
+        "no subtitles available for \"{0}\" — use --skip-subtitles to disable subtitles entirely or --allow-missing-subtitles to continue without them when absent"
     )]
     NoSubtitlesAvailable(String),
 

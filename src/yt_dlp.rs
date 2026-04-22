@@ -14,11 +14,11 @@ use std::process::Stdio;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
 use crate::ffmpeg;
-use crate::models::{MediaItem, SubtitleMode};
+use crate::models::{MediaItem, MissingSubtitlePolicy, SubtitleMode};
 use crate::subtitle_cleaner;
 
 const CCMA_VIDEO_URL_BASE: &str = "https://www.3cat.cat/3cat/x/video/";
@@ -64,6 +64,7 @@ pub async fn download(
     item: &MediaItem,
     directory: &str,
     subtitle_mode: SubtitleMode,
+    missing_subtitle_policy: MissingSubtitlePolicy,
     multi_progress: &MultiProgress,
 ) -> Result<()> {
     let url = format!("{}{}", CCMA_VIDEO_URL_BASE, item.id);
@@ -152,18 +153,10 @@ pub async fn download(
         return Ok(());
     }
 
-    // Collect subtitle files written by yt-dlp: {stem}.{lang}.vtt
-    let subtitle_langs = ["ca", "en", "es"];
-    let mut found: Vec<(PathBuf, &str)> = Vec::new();
-    for &lang in &subtitle_langs {
-        let vtt_path = std::path::Path::new(directory).join(item.filename(&format!("{lang}.vtt"))?);
-        if vtt_path.exists() {
-            found.push((vtt_path, lang));
-        }
-    }
-
+    let found = collect_subtitle_files(item, directory)?;
     if found.is_empty() {
-        return Err(Error::NoSubtitlesAvailable(item.title.clone()));
+        handle_missing_subtitles(&item.title, missing_subtitle_policy)?;
+        return Ok(());
     }
 
     for (vtt_path, _) in &found {
@@ -196,6 +189,36 @@ pub async fn download(
     Ok(())
 }
 
+fn collect_subtitle_files(
+    item: &MediaItem,
+    directory: &str,
+) -> Result<Vec<(PathBuf, &'static str)>> {
+    let subtitle_langs = ["ca", "en", "es"];
+    let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
+    for &lang in &subtitle_langs {
+        let vtt_path = std::path::Path::new(directory).join(item.filename(&format!("{lang}.vtt"))?);
+        if vtt_path.exists() {
+            found.push((vtt_path, lang));
+        }
+    }
+
+    Ok(found)
+}
+
+fn handle_missing_subtitles(
+    title: &str,
+    missing_subtitle_policy: MissingSubtitlePolicy,
+) -> Result<()> {
+    if missing_subtitle_policy.allows_missing() {
+        warn!(
+            "Subtitles requested for \"{title}\" but yt-dlp did not produce any subtitle files; continuing without subtitles"
+        );
+        return Ok(());
+    }
+
+    Err(Error::NoSubtitlesAvailable(title.to_string()))
+}
+
 /// Parses a yt-dlp `--progress --newline` stdout line into a progress position
 /// (0–1000, in tenths of a percent) and a display message.
 ///
@@ -225,6 +248,8 @@ fn create_progress_bar(label: &str, multi_progress: &MultiProgress) -> Result<Pr
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use indicatif::MultiProgress;
 
     use super::*;
@@ -273,7 +298,63 @@ mod tests {
             tv_show_name: Some("Test show".to_string()),
         };
         let mp = MultiProgress::new();
-        let result = download(&item, "/tmp", SubtitleMode::Skip, &mp).await;
+        let result = download(
+            &item,
+            "/tmp",
+            SubtitleMode::Skip,
+            MissingSubtitlePolicy::Strict,
+            &mp,
+        )
+        .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_should_error_when_missing_subtitles_are_strict() {
+        let result = handle_missing_subtitles("Episode title", MissingSubtitlePolicy::Strict);
+
+        assert!(
+            matches!(result, Err(Error::NoSubtitlesAvailable(title)) if title == "Episode title")
+        );
+    }
+
+    #[test]
+    fn test_should_allow_missing_subtitles_when_policy_is_permissive() {
+        let result = handle_missing_subtitles("Episode title", MissingSubtitlePolicy::AllowMissing);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_should_collect_existing_subtitle_files() {
+        let unique = format!(
+            "cat-show-downloader-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let item = MediaItem {
+            id: 1,
+            title: "Test episode".to_string(),
+            video_url: None,
+            subtitle_url: None,
+            episode_number: Some(1),
+            tv_show_name: Some("Test show".to_string()),
+        };
+        let subtitle_path = temp_dir.join(item.filename("ca.vtt").unwrap());
+        std::fs::write(&subtitle_path, "WEBVTT\n\n").unwrap();
+
+        let found = collect_subtitle_files(&item, temp_dir.to_str().unwrap()).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, PathBuf::from(&subtitle_path));
+        assert_eq!(found[0].1, "ca");
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

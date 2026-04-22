@@ -10,12 +10,29 @@ use crate::api_structs;
 use crate::error::{Error, Result};
 use crate::ffmpeg;
 use crate::http_client::HttpClientTrait;
-use crate::models::{DownloadParams, MediaItem, SubtitleMode};
+use crate::models::{DownloadParams, MediaItem, MissingSubtitlePolicy, SubtitleMode};
 use crate::subtitle_cleaner;
 use crate::yt_dlp;
 
 const TV3_SINGLE_MEDIA_API_URL: &str =
     "https://dinamics.ccma.cat/pvideo/media.jsp?media=video&version=0s&idint={id}";
+
+#[cfg(test)]
+static TEST_SINGLE_MEDIA_API_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn single_media_api_url(id: i32) -> String {
+    #[cfg(test)]
+    let template = TEST_SINGLE_MEDIA_API_URL
+        .lock()
+        .expect("test single-media API URL lock poisoned")
+        .clone()
+        .unwrap_or_else(|| TV3_SINGLE_MEDIA_API_URL.to_string());
+
+    #[cfg(not(test))]
+    let template = TV3_SINGLE_MEDIA_API_URL.to_string();
+
+    template.replace("{id}", &id.to_string())
+}
 
 /// Fetches metadata for a single media item and downloads its video and subtitle files.
 ///
@@ -40,6 +57,7 @@ pub async fn fetch_and_download_media(mut item: MediaItem, params: &DownloadPara
             &item,
             &params.directory,
             params.subtitle_mode,
+            params.missing_subtitle_policy,
             &params.multi_progress,
         )
         .await;
@@ -48,9 +66,7 @@ pub async fn fetch_and_download_media(mut item: MediaItem, params: &DownloadPara
     let api_response = params
         .http_client
         .get::<api_structs::SingleEpisodeRoot, api_structs::Tv3Error>(
-            TV3_SINGLE_MEDIA_API_URL
-                .replace("{id}", &item.id.to_string())
-                .as_str(),
+            single_media_api_url(item.id).as_str(),
             None,
         )
         .await
@@ -67,7 +83,7 @@ pub async fn fetch_and_download_media(mut item: MediaItem, params: &DownloadPara
     if let Some(subtitles) = api_response.subtitles.as_ref().and_then(|s| s.first()) {
         item.subtitle_url = Some(subtitles.url.clone());
     } else if params.subtitle_mode != SubtitleMode::Skip {
-        return Err(Error::NoSubtitlesAvailable(item.title.clone()));
+        handle_missing_subtitles(&item.title, params.missing_subtitle_policy)?;
     }
 
     let reqwest_client = params.http_client.inner();
@@ -134,40 +150,56 @@ async fn download_data(
         return Ok(());
     }
 
-    if let Some(subtitle_url) = &item.subtitle_url {
-        let subtitle_filename = item.filename("vtt")?;
-        let subtitle_path = full_media_path(item, directory, "vtt")?;
-        download_content(
-            subtitle_url,
-            &subtitle_path,
-            &subtitle_filename,
-            multi_progress,
-            client,
-        )
-        .await?;
+    let Some(subtitle_url) = &item.subtitle_url else {
+        return Ok(());
+    };
 
-        subtitle_cleaner::clean_vtt_file(std::path::Path::new(&subtitle_path))?;
+    let subtitle_filename = item.filename("vtt")?;
+    let subtitle_path = full_media_path(item, directory, "vtt")?;
+    download_content(
+        subtitle_url,
+        &subtitle_path,
+        &subtitle_filename,
+        multi_progress,
+        client,
+    )
+    .await?;
 
-        if subtitle_mode == SubtitleMode::Embed {
-            let track = ffmpeg::SubtitleTrack {
-                path: std::path::PathBuf::from(&subtitle_path),
-                lang_code: "ca".to_string(),
-            };
-            match ffmpeg::embed_subtitles(&video_path, &[track]).await {
-                Ok(mkv_path) => {
-                    info!("Subtitles embedded into video {mkv_path}");
-                }
-                Err(e) => {
-                    warn!("Failed to embed subtitles into {video_path}: {e}");
-                    info!("Downloaded subtitle to {subtitle_path}");
-                }
+    subtitle_cleaner::clean_vtt_file(std::path::Path::new(&subtitle_path))?;
+
+    if subtitle_mode == SubtitleMode::Embed {
+        let track = ffmpeg::SubtitleTrack {
+            path: std::path::PathBuf::from(&subtitle_path),
+            lang_code: "ca".to_string(),
+        };
+        match ffmpeg::embed_subtitles(&video_path, &[track]).await {
+            Ok(mkv_path) => {
+                info!("Subtitles embedded into video {mkv_path}");
             }
-        } else {
-            info!("Downloaded subtitle to {subtitle_path}");
+            Err(e) => {
+                warn!("Failed to embed subtitles into {video_path}: {e}");
+                info!("Downloaded subtitle to {subtitle_path}");
+            }
         }
+    } else {
+        info!("Downloaded subtitle to {subtitle_path}");
     }
 
     Ok(())
+}
+
+fn handle_missing_subtitles(
+    title: &str,
+    missing_subtitle_policy: MissingSubtitlePolicy,
+) -> Result<()> {
+    if missing_subtitle_policy.allows_missing() {
+        warn!(
+            "Subtitles requested for \"{title}\" but none were available; continuing without subtitles"
+        );
+        return Ok(());
+    }
+
+    Err(Error::NoSubtitlesAvailable(title.to_string()))
 }
 
 /// Video file extensions produced by yt-dlp or the built-in HTTP downloader.
@@ -361,4 +393,221 @@ async fn download_to_file(
     pb.finish_and_clear();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use indicatif::MultiProgress;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::{
+        fetch_and_download_media, handle_missing_subtitles, TEST_SINGLE_MEDIA_API_URL,
+    };
+    use crate::error::Error;
+    use crate::http_client::{HttpClient, HttpClientTrait};
+    use crate::models::{DownloadParams, MediaItem, MissingSubtitlePolicy, SubtitleMode};
+
+    #[derive(Clone, Debug, Default)]
+    struct LogCapture {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.buffer.lock().expect("log buffer lock poisoned").clone())
+                .expect("log buffer should contain valid UTF-8")
+        }
+    }
+
+    #[derive(Debug)]
+    struct LogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    async fn spawn_video_server(body: &'static [u8]) -> io::Result<(String, JoinHandle<io::Result<()>>)> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await?;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.write_all(body).await?;
+            stream.shutdown().await
+        });
+
+        Ok((format!("http://{address}/video.mp4"), server))
+    }
+
+    async fn spawn_json_server(body: String) -> io::Result<(String, JoinHandle<io::Result<()>>)> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await?;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.shutdown().await
+        });
+
+        Ok((format!("http://{address}/media?media=video&version=0s&idint={{id}}"), server))
+    }
+
+    #[derive(Debug)]
+    struct TestSingleMediaApiUrlGuard;
+
+    impl TestSingleMediaApiUrlGuard {
+        fn set(url: String) -> Self {
+            *TEST_SINGLE_MEDIA_API_URL
+                .lock()
+                .expect("test single-media API URL lock poisoned") = Some(url);
+            Self
+        }
+    }
+
+    impl Drop for TestSingleMediaApiUrlGuard {
+        fn drop(&mut self) {
+            *TEST_SINGLE_MEDIA_API_URL
+                .lock()
+                .expect("test single-media API URL lock poisoned") = None;
+        }
+    }
+
+    fn create_test_directory(test_name: &str) -> PathBuf {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cat_show_downloader_{test_name}_{}_{}",
+            std::process::id(),
+            unique_suffix
+        ))
+    }
+
+    #[test]
+    fn test_should_error_when_missing_subtitles_are_strict() {
+        let result = handle_missing_subtitles("Episode title", MissingSubtitlePolicy::Strict);
+
+        assert!(
+            matches!(result, Err(Error::NoSubtitlesAvailable(title)) if title == "Episode title")
+        );
+    }
+
+    #[test]
+    fn test_should_allow_missing_subtitles_when_policy_is_permissive() {
+        let result = handle_missing_subtitles("Episode title", MissingSubtitlePolicy::AllowMissing);
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_emit_single_warning_when_missing_subtitles_are_allowed_for_builtin_downloader() {
+        let log_capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(log_capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let directory = create_test_directory("missing_subtitles_warning");
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+
+        let (video_url, server) =
+            spawn_video_server(b"video-bytes").await.expect("test video server should start");
+        let api_response = format!(
+            r#"{{"media":{{"url":[{{"file":"{video_url}","active":true}}]}},"subtitols":null}}"#
+        );
+        let (api_url, api_server) = spawn_json_server(api_response)
+            .await
+            .expect("test API server should start");
+        let _api_url_guard = TestSingleMediaApiUrlGuard::set(api_url);
+
+        let item = MediaItem {
+            id: 42,
+            title: "Episode title".to_string(),
+            video_url: None,
+            subtitle_url: None,
+            episode_number: Some(1),
+            tv_show_name: Some("Show".to_string()),
+        };
+        let result = fetch_and_download_media(
+            item,
+            &DownloadParams {
+                http_client: Arc::new(HttpClient::new()),
+                subtitle_mode: SubtitleMode::Download,
+                missing_subtitle_policy: MissingSubtitlePolicy::AllowMissing,
+                concurrent_downloads: 1,
+                multi_progress: MultiProgress::new(),
+                directory: Arc::from(
+                    directory
+                        .to_str()
+                        .expect("test directory path should be valid UTF-8"),
+                ),
+                yt_dlp_available: false,
+            },
+        )
+        .await;
+
+        let server_result = server.await.expect("video server task should join");
+        let api_server_result = api_server.await.expect("API server task should join");
+        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
+
+        assert!(result.is_ok());
+        assert!(server_result.is_ok());
+        assert!(api_server_result.is_ok());
+
+        let warning =
+            "Subtitles requested for \"Episode title\" but none were available; continuing without subtitles";
+        let warning_count = log_capture.contents().matches(warning).count();
+
+        assert_eq!(warning_count, 1, "expected exactly one missing-subtitles warning");
+    }
 }

@@ -20,6 +20,23 @@ pub enum SubtitleMode {
     Embed,
 }
 
+/// Controls whether downloads should fail when subtitles are missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSubtitlePolicy {
+    /// Fail the download when subtitles were requested but none exist.
+    Strict,
+    /// Continue the download when subtitles are missing.
+    AllowMissing,
+}
+
+impl MissingSubtitlePolicy {
+    /// Returns `true` when missing subtitles should not fail the download.
+    #[must_use]
+    pub fn allows_missing(self) -> bool {
+        matches!(self, Self::AllowMissing)
+    }
+}
+
 /// Common parameters shared across media download operations.
 ///
 /// All fields are cheaply cloneable so the struct can be shared across
@@ -30,6 +47,8 @@ pub struct DownloadParams {
     pub http_client: Arc<HttpClient>,
     /// How subtitles should be handled during downloads.
     pub subtitle_mode: SubtitleMode,
+    /// Whether missing subtitles should fail the download.
+    pub missing_subtitle_policy: MissingSubtitlePolicy,
     /// Number of concurrent download tasks (1-10).
     pub concurrent_downloads: u8,
     /// Shared multi-progress bar renderer.
@@ -99,6 +118,12 @@ impl MediaItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_should_allow_missing_subtitles_only_in_allow_missing_mode() {
+        assert!(!MissingSubtitlePolicy::Strict.allows_missing());
+        assert!(MissingSubtitlePolicy::AllowMissing.allows_missing());
+    }
 
     #[test]
     fn test_should_generate_correct_filename_for_episode() {
