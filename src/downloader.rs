@@ -49,10 +49,6 @@ fn single_media_api_url(id: i32) -> String {
 /// Returns an error if the metadata fetch, download, or file I/O fails.
 pub async fn fetch_and_download_media(mut item: MediaItem, params: &DownloadParams) -> Result<()> {
     if params.yt_dlp_available {
-        if check_if_media_exists(&item, &params.directory).await? {
-            info!("Media item already exists: {}", item.filename("mp4")?);
-            return Ok(());
-        }
         return yt_dlp::download(
             &item,
             &params.directory,
@@ -114,12 +110,23 @@ async fn download_media(
     client: &Client,
     subtitle_mode: SubtitleMode,
 ) -> Result<()> {
-    if check_if_media_exists(item, directory).await? {
+    let existing_video_files = find_existing_video_files(item, directory).await?;
+    let subtitle_exists = builtin_subtitle_exists(item, directory)?;
+
+    if builtin_media_is_complete(&existing_video_files, subtitle_exists, subtitle_mode) {
         info!("Media item already exists: {}", item.filename("mp4")?);
         return Ok(());
     }
 
-    download_data(item, directory, multi_progress, client, subtitle_mode).await
+    download_data(
+        item,
+        directory,
+        multi_progress,
+        client,
+        subtitle_mode,
+        existing_video_files.reusable_video_path,
+    )
+    .await
 }
 
 #[instrument(skip_all)]
@@ -129,41 +136,50 @@ async fn download_data(
     multi_progress: &MultiProgress,
     client: &Client,
     subtitle_mode: SubtitleMode,
+    existing_video_path: Option<String>,
 ) -> Result<()> {
-    let Some(video_url) = &item.video_url else {
-        return Err(Error::MediaDoesNotHaveVideoUrl(item.filename("mp4")?));
-    };
+    let video_path = if let Some(path) = existing_video_path {
+        info!("Reusing existing video at {path}");
+        path
+    } else {
+        let Some(video_url) = &item.video_url else {
+            return Err(Error::MediaDoesNotHaveVideoUrl(item.filename("mp4")?));
+        };
 
-    let video_filename = item.filename("mp4")?;
-    let video_path = full_media_path(item, directory, "mp4")?;
-    download_content(
-        video_url,
-        &video_path,
-        &video_filename,
-        multi_progress,
-        client,
-    )
-    .await?;
-    info!("Downloaded video to {video_path}");
+        let video_filename = item.filename("mp4")?;
+        let video_path = full_media_path(item, directory, "mp4")?;
+        download_content(
+            video_url,
+            &video_path,
+            &video_filename,
+            multi_progress,
+            client,
+        )
+        .await?;
+        info!("Downloaded video to {video_path}");
+        video_path
+    };
 
     if subtitle_mode == SubtitleMode::Skip {
         return Ok(());
     }
 
-    let Some(subtitle_url) = &item.subtitle_url else {
-        return Ok(());
-    };
-
     let subtitle_filename = item.filename("vtt")?;
     let subtitle_path = full_media_path(item, directory, "vtt")?;
-    download_content(
-        subtitle_url,
-        &subtitle_path,
-        &subtitle_filename,
-        multi_progress,
-        client,
-    )
-    .await?;
+    if !non_empty_file_exists(&subtitle_path) {
+        let Some(subtitle_url) = &item.subtitle_url else {
+            return Ok(());
+        };
+
+        download_content(
+            subtitle_url,
+            &subtitle_path,
+            &subtitle_filename,
+            multi_progress,
+            client,
+        )
+        .await?;
+    }
 
     subtitle_cleaner::clean_vtt_file(std::path::Path::new(&subtitle_path))?;
 
@@ -204,21 +220,30 @@ fn handle_missing_subtitles(
 
 /// Video file extensions produced by yt-dlp or the built-in HTTP downloader.
 ///
-/// Used by [`check_if_media_exists`] to match any video file for a given stem
+/// Used by [`find_existing_video_files`] to match any video file for a given stem
 /// while ignoring subtitle (`.vtt`, `.ass`) and other non-video files.
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "ts", "m4v"];
 
-/// Returns `true` when a non-empty video file with the same stem as `item`
-/// already exists in `directory`, regardless of container extension.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExistingVideoFiles {
+    pub(crate) reusable_video_path: Option<String>,
+    pub(crate) embedded_video_path: Option<String>,
+}
+
+/// Returns the local video artifacts already present for `item`.
 ///
 /// This covers the case where yt-dlp chose an extension other than `.mp4`
 /// (e.g. `.webm`) or where ffmpeg previously produced a `.mkv` after
 /// embedding subtitles.  Stale `.mp4.tmp` files left by interrupted
 /// HTTP downloads are cleaned up before the check.
 #[instrument(skip_all)]
-async fn check_if_media_exists(item: &MediaItem, directory: &str) -> Result<bool> {
+pub(crate) async fn find_existing_video_files(
+    item: &MediaItem,
+    directory: &str,
+) -> Result<ExistingVideoFiles> {
     let video_path = full_media_path(item, directory, "mp4")?;
     let tmp_path = format!("{video_path}.tmp");
+    let mut video_files = ExistingVideoFiles::default();
 
     // Clean up stale .tmp files from previous interrupted runs.
     let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -260,12 +285,42 @@ async fn check_if_media_exists(item: &MediaItem, directory: &str) -> Result<bool
         let full_path_str = full_path
             .to_str()
             .ok_or_else(|| Error::InvalidPathEncoding(format!("{}", full_path.display())))?;
-        if non_empty_file_exists(full_path_str) {
-            return Ok(true);
+        if !non_empty_file_exists(full_path_str) {
+            continue;
+        }
+
+        let full_path_string = full_path_str.to_string();
+
+        if ext == "mkv" {
+            if video_files.embedded_video_path.is_none() {
+                video_files.embedded_video_path = Some(full_path_string);
+            }
+            continue;
+        }
+
+        if video_files.reusable_video_path.is_none() {
+            video_files.reusable_video_path = Some(full_path_string);
         }
     }
 
-    Ok(false)
+    Ok(video_files)
+}
+
+fn builtin_subtitle_exists(item: &MediaItem, directory: &str) -> Result<bool> {
+    let subtitle_path = full_media_path(item, directory, "vtt")?;
+    Ok(non_empty_file_exists(&subtitle_path))
+}
+
+fn builtin_media_is_complete(
+    video_files: &ExistingVideoFiles,
+    subtitle_exists: bool,
+    subtitle_mode: SubtitleMode,
+) -> bool {
+    match subtitle_mode {
+        SubtitleMode::Skip => video_files.reusable_video_path.is_some(),
+        SubtitleMode::Download => video_files.reusable_video_path.is_some() && subtitle_exists,
+        SubtitleMode::Embed => video_files.embedded_video_path.is_some(),
+    }
 }
 
 /// Returns `true` when `path` exists and has a non-zero size.
@@ -410,7 +465,8 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        fetch_and_download_media, handle_missing_subtitles, TEST_SINGLE_MEDIA_API_URL,
+        TEST_SINGLE_MEDIA_API_URL, builtin_media_is_complete, fetch_and_download_media,
+        find_existing_video_files, handle_missing_subtitles,
     };
     use crate::error::Error;
     use crate::http_client::{HttpClient, HttpClientTrait};
@@ -423,8 +479,13 @@ mod tests {
 
     impl LogCapture {
         fn contents(&self) -> String {
-            String::from_utf8(self.buffer.lock().expect("log buffer lock poisoned").clone())
-                .expect("log buffer should contain valid UTF-8")
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("log buffer lock poisoned")
+                    .clone(),
+            )
+            .expect("log buffer should contain valid UTF-8")
         }
     }
 
@@ -457,7 +518,9 @@ mod tests {
         }
     }
 
-    async fn spawn_video_server(body: &'static [u8]) -> io::Result<(String, JoinHandle<io::Result<()>>)> {
+    async fn spawn_video_server(
+        body: &'static [u8],
+    ) -> io::Result<(String, JoinHandle<io::Result<()>>)> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(async move {
@@ -494,7 +557,10 @@ mod tests {
             stream.shutdown().await
         });
 
-        Ok((format!("http://{address}/media?media=video&version=0s&idint={{id}}"), server))
+        Ok((
+            format!("http://{address}/media?media=video&version=0s&idint={{id}}"),
+            server,
+        ))
     }
 
     #[derive(Debug)]
@@ -546,7 +612,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_should_emit_single_warning_when_missing_subtitles_are_allowed_for_builtin_downloader() {
+    async fn test_should_emit_single_warning_when_missing_subtitles_are_allowed_for_builtin_downloader()
+     {
         let log_capture = LogCapture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -560,8 +627,9 @@ mod tests {
         let directory = create_test_directory("missing_subtitles_warning");
         std::fs::create_dir_all(&directory).expect("test directory should be created");
 
-        let (video_url, server) =
-            spawn_video_server(b"video-bytes").await.expect("test video server should start");
+        let (video_url, server) = spawn_video_server(b"video-bytes")
+            .await
+            .expect("test video server should start");
         let api_response = format!(
             r#"{{"media":{{"url":[{{"file":"{video_url}","active":true}}]}},"subtitols":null}}"#
         );
@@ -604,10 +672,151 @@ mod tests {
         assert!(server_result.is_ok());
         assert!(api_server_result.is_ok());
 
-        let warning =
-            "Subtitles requested for \"Episode title\" but none were available; continuing without subtitles";
+        let warning = "Subtitles requested for \"Episode title\" but none were available; continuing without subtitles";
         let warning_count = log_capture.contents().matches(warning).count();
 
-        assert_eq!(warning_count, 1, "expected exactly one missing-subtitles warning");
+        assert_eq!(
+            warning_count, 1,
+            "expected exactly one missing-subtitles warning"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_download_missing_subtitle_without_redownloading_existing_video() {
+        let directory = create_test_directory("subtitle_recovery_builtin");
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+
+        let item = MediaItem {
+            id: 77,
+            title: "Episode title".to_string(),
+            video_url: None,
+            subtitle_url: None,
+            episode_number: Some(1),
+            tv_show_name: Some("Show".to_string()),
+        };
+        let video_path = directory.join(item.filename("mp4").expect("video filename should build"));
+        let subtitle_path = directory.join(
+            item.filename("vtt")
+                .expect("subtitle filename should build"),
+        );
+        std::fs::write(&video_path, b"existing-video-bytes")
+            .expect("existing video file should be written");
+
+        let (subtitle_url, subtitle_server) =
+            spawn_video_server(b"WEBVTT\n\n00:00.000 --> 00:01.000\nRecovered subtitle\n")
+                .await
+                .expect("subtitle server should start");
+        let api_response = format!(
+            r#"{{"media":{{"url":[{{"file":"http://127.0.0.1:9/video.mp4","active":true}}]}},"subtitols":[{{"url":"{subtitle_url}"}}]}}"#
+        );
+        let (api_url, api_server) = spawn_json_server(api_response)
+            .await
+            .expect("test API server should start");
+        let _api_url_guard = TestSingleMediaApiUrlGuard::set(api_url);
+
+        let result = fetch_and_download_media(
+            item,
+            &DownloadParams {
+                http_client: Arc::new(HttpClient::new()),
+                subtitle_mode: SubtitleMode::Download,
+                missing_subtitle_policy: MissingSubtitlePolicy::Strict,
+                concurrent_downloads: 1,
+                multi_progress: MultiProgress::new(),
+                directory: Arc::from(
+                    directory
+                        .to_str()
+                        .expect("test directory path should be valid UTF-8"),
+                ),
+                yt_dlp_available: false,
+            },
+        )
+        .await;
+
+        let subtitle_server_result = subtitle_server
+            .await
+            .expect("subtitle server task should join");
+        let api_server_result = api_server.await.expect("API server task should join");
+
+        let video_bytes = std::fs::read(&video_path).expect("existing video should still exist");
+        let subtitle_contents =
+            std::fs::read_to_string(&subtitle_path).expect("subtitle file should be present");
+
+        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
+
+        assert!(result.is_ok());
+        assert!(subtitle_server_result.is_ok());
+        assert!(api_server_result.is_ok());
+        assert_eq!(video_bytes, b"existing-video-bytes");
+        assert!(subtitle_contents.contains("Recovered subtitle"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_treat_existing_video_without_subtitle_as_incomplete_for_download_mode() {
+        let directory = create_test_directory("download_incomplete_without_subtitle");
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+
+        let item = MediaItem {
+            id: 11,
+            title: "Episode title".to_string(),
+            video_url: None,
+            subtitle_url: None,
+            episode_number: Some(1),
+            tv_show_name: Some("Show".to_string()),
+        };
+        let video_path = directory.join(item.filename("mp4").expect("video filename should build"));
+        std::fs::write(&video_path, b"existing-video-bytes")
+            .expect("existing video file should be written");
+
+        let video_files = find_existing_video_files(
+            &item,
+            directory
+                .to_str()
+                .expect("test directory path should be valid UTF-8"),
+        )
+        .await
+        .expect("existing video files should be resolved");
+
+        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
+
+        assert!(!builtin_media_is_complete(
+            &video_files,
+            false,
+            SubtitleMode::Download,
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_treat_existing_mkv_as_complete_for_embed_mode() {
+        let directory = create_test_directory("embed_complete_with_mkv");
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+
+        let item = MediaItem {
+            id: 12,
+            title: "Episode title".to_string(),
+            video_url: None,
+            subtitle_url: None,
+            episode_number: Some(1),
+            tv_show_name: Some("Show".to_string()),
+        };
+        let video_path = directory.join(item.filename("mkv").expect("video filename should build"));
+        std::fs::write(&video_path, b"embedded-video-bytes")
+            .expect("embedded video file should be written");
+
+        let video_files = find_existing_video_files(
+            &item,
+            directory
+                .to_str()
+                .expect("test directory path should be valid UTF-8"),
+        )
+        .await
+        .expect("existing video files should be resolved");
+
+        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
+
+        assert!(builtin_media_is_complete(
+            &video_files,
+            false,
+            SubtitleMode::Embed,
+        ));
     }
 }

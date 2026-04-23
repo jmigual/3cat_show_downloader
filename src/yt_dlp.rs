@@ -16,12 +16,21 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{info, instrument, warn};
 
+use crate::downloader::{ExistingVideoFiles, find_existing_video_files};
 use crate::error::{Error, Result};
 use crate::ffmpeg;
 use crate::models::{MediaItem, MissingSubtitlePolicy, SubtitleMode};
 use crate::subtitle_cleaner;
 
 const CCMA_VIDEO_URL_BASE: &str = "https://www.3cat.cat/3cat/x/video/";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadStrategy {
+    Complete,
+    FullDownload,
+    SubtitleOnly,
+    EmbedExistingVideo,
+}
 
 /// Checks whether `yt-dlp` is available on the system PATH.
 ///
@@ -75,78 +84,80 @@ pub async fn download(
         .ok_or_else(|| Error::InvalidPathEncoding(output_filename.clone()))?
         .to_string();
 
-    info!("Downloading with yt-dlp: {url}");
+    let existing_video_files = find_existing_video_files(item, directory).await?;
+    let existing_subtitles = collect_subtitle_files(item, directory)?;
+    let strategy = determine_download_strategy(
+        &existing_video_files,
+        subtitle_mode,
+        existing_subtitles.len(),
+    );
 
-    let mut cmd = Command::new("yt-dlp");
-    cmd.args([
-        "--no-playlist",
-        "--progress",
-        "--newline",
-        "-o",
-        &output_template,
-    ]);
-
-    match subtitle_mode {
-        SubtitleMode::Skip => {}
-        SubtitleMode::Download | SubtitleMode::Embed => {
-            // Always use --write-subs so the VTT lands on disk and can be
-            // processed by our cleaning + embedding pipeline.  --embed-subs
-            // is intentionally not used: it skips our cleaner and produces
-            // broken subtitle tracks for CCMA content.
-            cmd.args(["--write-subs", "--sub-langs", "ca,en,es"]);
-        }
+    if strategy == DownloadStrategy::Complete {
+        info!("Media item already exists: {}", item.filename("mp4")?);
+        return Ok(());
     }
 
-    cmd.arg(&url);
+    if strategy != DownloadStrategy::EmbedExistingVideo {
+        info!("Downloading with yt-dlp: {url}");
 
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::YtDlp(format!("failed to run yt-dlp: {e}")))?;
+        let mut cmd = Command::new("yt-dlp");
+        let args = build_download_arguments(
+            &output_template,
+            &url,
+            subtitle_mode,
+            strategy == DownloadStrategy::SubtitleOnly,
+        );
+        cmd.args(&args);
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::YtDlp("failed to capture stdout from yt-dlp".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::YtDlp("failed to capture stderr from yt-dlp".to_string()))?;
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::YtDlp(format!("failed to run yt-dlp: {e}")))?;
 
-    let pb = create_progress_bar(&output_filename, multi_progress)?;
-    let pb_clone = pb.clone();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::YtDlp("failed to capture stdout from yt-dlp".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::YtDlp("failed to capture stderr from yt-dlp".to_string()))?;
 
-    let progress_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some((pos, msg)) = parse_download_progress(&line) {
-                pb_clone.set_position(pos);
-                pb_clone.set_message(msg);
+        let pb = create_progress_bar(&output_filename, multi_progress)?;
+        let pb_clone = pb.clone();
+
+        let progress_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some((pos, msg)) = parse_download_progress(&line) {
+                    pb_clone.set_position(pos);
+                    pb_clone.set_message(msg);
+                }
             }
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+            buf
+        });
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| Error::YtDlp(format!("failed to wait for yt-dlp: {e}")))?;
+
+        let _ = progress_task.await;
+        pb.finish_and_clear();
+
+        if !status.success() {
+            let stderr_output = stderr_task.await.unwrap_or_default();
+            return Err(Error::YtDlp(format!(
+                "yt-dlp exited with {}: {stderr_output}",
+                status
+            )));
         }
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
-        buf
-    });
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| Error::YtDlp(format!("failed to wait for yt-dlp: {e}")))?;
-
-    let _ = progress_task.await;
-    pb.finish_and_clear();
-
-    if !status.success() {
-        let stderr_output = stderr_task.await.unwrap_or_default();
-        return Err(Error::YtDlp(format!(
-            "yt-dlp exited with {}: {stderr_output}",
-            status
-        )));
     }
 
     if subtitle_mode == SubtitleMode::Skip {
@@ -172,13 +183,14 @@ pub async fn download(
             })
             .collect();
 
-        let video_filename = item.filename("mp4")?;
-        let video_path = std::path::Path::new(directory).join(&video_filename);
-        let video_str = video_path
-            .to_str()
-            .ok_or_else(|| Error::InvalidPathEncoding(video_filename.clone()))?;
+        let video_files = find_existing_video_files(item, directory).await?;
+        let video_str = video_files.reusable_video_path.ok_or_else(|| {
+            Error::YtDlp(
+                "yt-dlp did not leave a reusable video file for subtitle embedding".to_string(),
+            )
+        })?;
 
-        match ffmpeg::embed_subtitles(video_str, &tracks).await {
+        match ffmpeg::embed_subtitles(&video_str, &tracks).await {
             Ok(mkv_path) => info!("Subtitles embedded into video {mkv_path}"),
             Err(e) => {
                 tracing::warn!("Failed to embed subtitles into {video_str}: {e}");
@@ -197,12 +209,110 @@ fn collect_subtitle_files(
     let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
     for &lang in &subtitle_langs {
         let vtt_path = std::path::Path::new(directory).join(item.filename(&format!("{lang}.vtt"))?);
-        if vtt_path.exists() {
-            found.push((vtt_path, lang));
+        let Ok(metadata) = vtt_path.metadata() else {
+            let path_str = vtt_path.to_string_lossy();
+            warn!(
+                path = %vtt_path.display(),
+                "Failed to get metadata for subtitle file {path_str}, skipping it",
+            );
+            continue;
+        };
+
+        if !metadata.is_file() {
+            continue;
         }
+
+        if metadata.len() == 0 {
+            if let Err(error) = std::fs::remove_file(&vtt_path) {
+                warn!(
+                    path = %vtt_path.display(),
+                    %error,
+                    "Failed to remove empty subtitle artifact left by yt-dlp",
+                );
+            }
+            continue;
+        }
+        found.push((vtt_path, lang));
     }
 
     Ok(found)
+}
+
+fn determine_download_strategy(
+    video_files: &ExistingVideoFiles,
+    subtitle_mode: SubtitleMode,
+    subtitle_file_count: usize,
+) -> DownloadStrategy {
+    match subtitle_mode {
+        SubtitleMode::Skip => {
+            if video_files.reusable_video_path.is_some() {
+                DownloadStrategy::Complete
+            } else {
+                DownloadStrategy::FullDownload
+            }
+        }
+        SubtitleMode::Download => {
+            if video_files.reusable_video_path.is_some() {
+                if subtitle_file_count > 0 {
+                    DownloadStrategy::Complete
+                } else {
+                    DownloadStrategy::SubtitleOnly
+                }
+            } else {
+                DownloadStrategy::FullDownload
+            }
+        }
+        SubtitleMode::Embed => {
+            if video_files.embedded_video_path.is_some() {
+                DownloadStrategy::Complete
+            } else if video_files.reusable_video_path.is_some() {
+                if subtitle_file_count > 0 {
+                    DownloadStrategy::EmbedExistingVideo
+                } else {
+                    DownloadStrategy::SubtitleOnly
+                }
+            } else {
+                DownloadStrategy::FullDownload
+            }
+        }
+    }
+}
+
+fn build_download_arguments(
+    output_template: &str,
+    url: &str,
+    subtitle_mode: SubtitleMode,
+    subtitle_only: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--no-playlist".to_string(),
+        "--progress".to_string(),
+        "--newline".to_string(),
+        "-o".to_string(),
+        output_template.to_string(),
+    ];
+
+    if subtitle_only {
+        args.push("--skip-download".to_string());
+    }
+
+    match subtitle_mode {
+        SubtitleMode::Skip => {}
+        SubtitleMode::Download | SubtitleMode::Embed => {
+            // Always use --write-subs so the VTT lands on disk and can be
+            // processed by our cleaning + embedding pipeline.  --embed-subs
+            // is intentionally not used: it skips our cleaner and produces
+            // broken subtitle tracks for CCMA content.
+            args.extend([
+                "--write-subs".to_string(),
+                "--sub-langs".to_string(),
+                "ca,en,es".to_string(),
+            ]);
+        }
+    }
+
+    args.push(url.to_string());
+    args
 }
 
 fn handle_missing_subtitles(
@@ -356,5 +466,109 @@ mod tests {
         assert_eq!(found[0].1, "ca");
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_should_ignore_zero_byte_subtitle_files_for_recovery_strategy() {
+        let unique = format!(
+            "cat-show-downloader-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let item = MediaItem {
+            id: 1,
+            title: "Test episode".to_string(),
+            video_url: None,
+            subtitle_url: None,
+            episode_number: Some(1),
+            tv_show_name: Some("Test show".to_string()),
+        };
+        let subtitle_path = temp_dir.join(item.filename("ca.vtt").unwrap());
+        std::fs::File::create(&subtitle_path).unwrap();
+
+        let found = collect_subtitle_files(&item, temp_dir.to_str().unwrap()).unwrap();
+        let video_files = ExistingVideoFiles {
+            reusable_video_path: Some("episode.webm".to_string()),
+            embedded_video_path: None,
+        };
+
+        assert!(found.is_empty());
+        assert!(!subtitle_path.exists());
+        assert_eq!(
+            determine_download_strategy(&video_files, SubtitleMode::Download, found.len()),
+            DownloadStrategy::SubtitleOnly,
+        );
+        assert_eq!(
+            determine_download_strategy(&video_files, SubtitleMode::Embed, found.len()),
+            DownloadStrategy::SubtitleOnly,
+        );
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_should_choose_subtitle_only_recovery_when_video_exists_without_subtitles() {
+        let video_files = ExistingVideoFiles {
+            reusable_video_path: Some("episode.webm".to_string()),
+            embedded_video_path: None,
+        };
+
+        assert_eq!(
+            determine_download_strategy(&video_files, SubtitleMode::Download, 0),
+            DownloadStrategy::SubtitleOnly,
+        );
+        assert_eq!(
+            determine_download_strategy(&video_files, SubtitleMode::Embed, 0),
+            DownloadStrategy::SubtitleOnly,
+        );
+    }
+
+    #[test]
+    fn test_should_treat_existing_mkv_as_complete_for_embed_mode() {
+        let video_files = ExistingVideoFiles {
+            reusable_video_path: None,
+            embedded_video_path: Some("episode.mkv".to_string()),
+        };
+
+        assert_eq!(
+            determine_download_strategy(&video_files, SubtitleMode::Embed, 0),
+            DownloadStrategy::Complete,
+        );
+    }
+
+    #[test]
+    fn test_should_embed_existing_video_when_subtitles_are_already_present() {
+        let video_files = ExistingVideoFiles {
+            reusable_video_path: Some("episode.webm".to_string()),
+            embedded_video_path: None,
+        };
+
+        assert_eq!(
+            determine_download_strategy(&video_files, SubtitleMode::Embed, 1),
+            DownloadStrategy::EmbedExistingVideo,
+        );
+    }
+
+    #[test]
+    fn test_should_add_skip_download_for_subtitle_only_recovery() {
+        let args = build_download_arguments(
+            "C:/tmp/output.%(ext)s",
+            "https://www.3cat.cat/3cat/x/video/1",
+            SubtitleMode::Embed,
+            true,
+        );
+
+        assert!(args.contains(&"--skip-download".to_string()));
+        assert!(args.contains(&"--write-subs".to_string()));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://www.3cat.cat/3cat/x/video/1")
+        );
     }
 }
