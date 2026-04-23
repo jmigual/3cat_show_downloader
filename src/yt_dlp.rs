@@ -14,7 +14,7 @@ use std::process::Stdio;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::downloader::{ExistingVideoFiles, find_existing_video_files};
 use crate::error::{Error, Result};
@@ -209,6 +209,11 @@ fn collect_subtitle_files(
     let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
     for &lang in &subtitle_langs {
         let vtt_path = std::path::Path::new(directory).join(item.filename(&format!("{lang}.vtt"))?);
+        if !vtt_path.exists() {
+            debug!("Subtitle file does not exist: {}", vtt_path.display());
+            continue;
+        }
+
         let Ok(metadata) = vtt_path.metadata() else {
             let path_str = vtt_path.to_string_lossy();
             warn!(
