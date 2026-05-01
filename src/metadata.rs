@@ -190,7 +190,10 @@ fn media_item_from_episode(episode: &MetadataEpisode) -> MediaItem {
 
 fn select_cover_url(images: &[MetadataImage]) -> Option<&str> {
     images.iter().find_map(|image| {
-        let size_matches = image.size.as_deref().is_some_and(|size| size == "master");
+        let size_matches = image
+            .size
+            .as_deref()
+            .is_some_and(|size| size.eq_ignore_ascii_case("master"));
         let relation_matches = image
             .relation_name
             .as_deref()
@@ -314,21 +317,69 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_match_cover_variant_with_alternative_casing() {
-        let images = vec![
-            MetadataImage {
-                size: Some("MASTER".to_string()),
-                relation_name: Some("KEYVIDEO".to_string()),
-                url: "https://example.invalid/uppercase-size.jpg".to_string(),
-            },
-            MetadataImage {
-                size: Some("master".to_string()),
-                relation_name: Some("keyvideo".to_string()),
-                url: "https://example.invalid/lowercase-relation.jpg".to_string(),
-            },
-        ];
+    fn test_should_match_cover_variant_when_live_payload_uses_uppercase_master() {
+        let images = vec![MetadataImage {
+            size: Some("MASTER".to_string()),
+            relation_name: Some("KEYVIDEO".to_string()),
+            url: "https://example.invalid/uppercase-size.jpg".to_string(),
+        }];
+
+        assert_eq!(
+            select_cover_url(&images),
+            Some("https://example.invalid/uppercase-size.jpg")
+        );
+    }
+
+    #[test]
+    fn test_should_not_match_cover_variant_when_relation_name_casing_differs() {
+        let images = vec![MetadataImage {
+            size: Some("master".to_string()),
+            relation_name: Some("keyvideo".to_string()),
+            url: "https://example.invalid/lowercase-relation.jpg".to_string(),
+        }];
 
         assert_eq!(select_cover_url(&images), None);
+    }
+
+    #[test]
+    fn test_should_deserialize_metadata_images_when_api_uses_text_field_for_url() {
+        let response_json = r#"{
+            "resposta": {
+                "items": {
+                    "item": [
+                        {
+                            "id": 101,
+                            "capitol": 1,
+                            "permatitle": "episode-one",
+                            "titol": "Episode One",
+                            "programa": "Sample Show",
+                            "data_publicacio": "2024-01-01",
+                            "data_emissio": null,
+                            "imatges": [
+                                {
+                                    "mida": "1014x570",
+                                    "rel_name": "KEYVIDEO",
+                                    "text": "https://example.invalid/cover.jpg"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let response: MetadataEpisodesRoot =
+            serde_json::from_str(response_json).expect("metadata response should parse");
+
+        assert_eq!(response.response.items.item.len(), 1);
+        assert_eq!(
+            response.response.items.item[0].images,
+            vec![MetadataImage {
+                size: Some("1014x570".to_string()),
+                relation_name: Some("KEYVIDEO".to_string()),
+                url: "https://example.invalid/cover.jpg".to_string(),
+            }]
+        );
     }
 
     #[tokio::test]

@@ -138,6 +138,6 @@ pub struct MetadataImage {
     #[serde(rename = "rel_name", alias = "realname")]
     pub relation_name: Option<String>,
     /// Direct URL to the image.
-    #[serde(alias = "file")]
+    #[serde(alias = "file", alias = "text")]
     pub url: String,
 }
