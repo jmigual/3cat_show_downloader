@@ -248,6 +248,19 @@ async fn download_cover(
     let extension = extension_from_url(cover_url);
     let file_name = format!("{}-cover-{}.{}", item.filename_stem()?, item.id, extension);
     let output_path = Path::new(directory).join(&file_name);
+
+    if tokio::fs::try_exists(&output_path)
+        .await
+        .map_err(|error| Error::Downloading(error.to_string()))?
+    {
+        info!(
+            path = %output_path.display(),
+            episode_id = item.id,
+            "Skipping cover download because destination already exists"
+        );
+        return Ok(file_name);
+    }
+
     let output_path_str = output_path
         .to_str()
         .ok_or_else(|| Error::InvalidPathEncoding(output_path.display().to_string()))?;
@@ -645,6 +658,79 @@ mod tests {
         assert_eq!(entries[0].episode_number_within_season, Some(4));
         assert_eq!(entries[0].cover_path, None);
         assert!(!temp_dir.join("1-episode-one-cover-101.jpg").exists());
+
+        std::fs::remove_dir_all(&temp_dir).expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_should_not_download_cover_when_destination_file_already_exists() {
+        let temp_dir = unique_test_directory("metadata-cover-existing-file");
+        std::fs::create_dir_all(&temp_dir).expect("test directory should be created");
+
+        let existing_cover_name = "1-episode-one-cover-101.jpg";
+        let existing_cover_path = temp_dir.join(existing_cover_name);
+        let existing_cover_bytes = b"existing-cover";
+        tokio::fs::write(&existing_cover_path, existing_cover_bytes)
+            .await
+            .expect("existing cover should be written");
+
+        let response_json = r#"{
+            "resposta": {
+                "items": {
+                    "item": [
+                        {
+                            "id": 101,
+                            "capitol": 1,
+                            "permatitle": "episode-one",
+                            "titol": "Episode One",
+                            "programa": "Sample Show",
+                            "entradeta": "Episode One summary",
+                            "durada": "00:08:44:21",
+                            "data_publicacio": { "utc": "2024-01-01T00:00:00Z" },
+                            "data_emissio": "2024-01-02",
+                            "capitol_temporada": 4,
+                            "temporades": [
+                                { "id": "PUTEMP_26", "desc": "26a Temporada", "main": true }
+                            ],
+                            "imatges": [
+                                { "mida": "master", "rel_name": "KEYVIDEO", "url": "http://127.0.0.1:9/cover.jpg" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let http_client = Arc::new(MockHttpClient::new(vec![response_json]));
+        let reqwest_client = Client::new();
+
+        write_tv_show_metadata_with_clients(
+            http_client,
+            &reqwest_client,
+            777,
+            "sample-show",
+            temp_dir
+                .to_str()
+                .expect("temp dir path should be valid utf-8"),
+            &MultiProgress::new(),
+        )
+        .await
+        .expect("metadata workflow should reuse existing cover");
+
+        let metadata_path = temp_dir.join("sample-show-metadata.json");
+        let metadata_json = tokio::fs::read_to_string(&metadata_path)
+            .await
+            .expect("metadata file should be readable");
+        let entries: Vec<MetadataOutputEntry> =
+            serde_json::from_str(&metadata_json).expect("metadata JSON should parse");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cover_path.as_deref(), Some(existing_cover_name));
+
+        let saved_cover = tokio::fs::read(&existing_cover_path)
+            .await
+            .expect("existing cover should still be readable");
+        assert_eq!(saved_cover, existing_cover_bytes);
 
         std::fs::remove_dir_all(&temp_dir).expect("test directory should be removed");
     }
