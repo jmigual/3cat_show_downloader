@@ -81,6 +81,26 @@ pub struct MediaItem {
 }
 
 impl MediaItem {
+    /// Generates the sanitized filename stem for the media item.
+    ///
+    /// This is the filename without the extension and is shared by the video,
+    /// subtitle, and metadata asset naming code paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal regex patterns fail to compile.
+    pub fn filename_stem(&self) -> Result<String> {
+        let slug = Self::slugify(&self.title)?;
+
+        match (self.episode_number, &self.tv_show_name) {
+            (Some(ep_num), Some(show_name)) if show_name.to_lowercase().contains("ova") => {
+                Ok(format!("ova-{ep_num}-{slug}"))
+            }
+            (Some(ep_num), _) => Ok(format!("{ep_num}-{slug}")),
+            (None, _) => Ok(slug),
+        }
+    }
+
     /// Generates a sanitized filename for the media item with the given extension.
     ///
     /// For TV show episodes the filename includes the episode number as a prefix
@@ -92,15 +112,7 @@ impl MediaItem {
     ///
     /// Returns an error if the internal regex patterns fail to compile.
     pub fn filename(&self, extension: &str) -> Result<String> {
-        let slug = Self::slugify(&self.title)?;
-
-        match (self.episode_number, &self.tv_show_name) {
-            (Some(ep_num), Some(show_name)) if show_name.to_lowercase().contains("ova") => {
-                Ok(format!("ova-{ep_num}-{slug}.{extension}"))
-            }
-            (Some(ep_num), _) => Ok(format!("{ep_num}-{slug}.{extension}")),
-            (None, _) => Ok(format!("{slug}.{extension}")),
-        }
+        Ok(format!("{}.{extension}", self.filename_stem()?))
     }
 
     /// Converts a title into a URL-friendly slug.
@@ -138,6 +150,10 @@ mod tests {
         assert_eq!(
             item.filename("mp4").unwrap(),
             "7-t1xc7-veureu-una-cosa-allucinant-i-magica.mp4"
+        );
+        assert_eq!(
+            item.filename_stem().unwrap(),
+            "7-t1xc7-veureu-una-cosa-allucinant-i-magica"
         );
     }
 

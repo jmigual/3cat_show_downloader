@@ -10,21 +10,27 @@ Tens dues opcions per utilitzar aquest programa: pots clonar el repositori i exe
 
 ### Executar el programa manualment
 
-Clona aquest repositori i executa el programa amb la seguent comanda:
+Clona aquest repositori i executa el programa amb una d'aquestes comandes:
 
 ```bash
-cargo run -- bola-de-drac --directory ~/Downloads/bola-de-drac/
+cargo run -- download bola-de-drac --directory ~/Downloads/bola-de-drac/
+
+# o be, per desar les metadades dels episodis i les imatges de portada d'una sèrie
+cargo run -- metadata bola-de-drac --directory ~/Downloads/bola-de-drac/
 ```
 
 ### Executar el binari descarregat
 
-Descarrega el binari des de [releases](https://github.com/mcamara/3cat_show_downloader/releases) i executa la seguent comanda:
+Descarrega el binari des de [releases](https://github.com/mcamara/3cat_show_downloader/releases) i executa una d'aquestes comandes:
 
 ```bash
-./cat_show_downloader bola-de-drac --directory ~/Downloads/bola-de-drac/
+./cat_show_downloader download bola-de-drac --directory ~/Downloads/bola-de-drac/
+
+# o be, per escriure el JSON de metadades dels episodis i descarregar les portades d'una sèrie al directori indicat
+./cat_show_downloader metadata bola-de-drac --directory ~/Downloads/bola-de-drac/
 ```
 
-### Opcions
+### Opcions de `download`
 
 | Opcio | Curt | Descripcio | Per defecte |
 |---|---|---|---|
@@ -33,37 +39,53 @@ Descarrega el binari des de [releases](https://github.com/mcamara/3cat_show_down
 | `--start-from-episode` | `-s` | Numero de capitol des del qual comencar (ignorat per pel·lícules) | `1` |
 | `--concurrent-downloads` | `-c` | Numero de fitxers a descarregar alhora (1-10) | `2` |
 | `--skip-subtitles` | | No descarregar els subtítols | `false` |
+| `--allow-missing-subtitles` | | Continuar la descarrega quan faltin subtítols | `false` |
 | `--fix-existing-subtitles` | `-f` | Netejar els fitxers de subtítols (.vtt) ja descarregats al directori | `false` |
 | `--embed-existing-subtitles` | | Netejar i incrustar els subtítols als videos ja descarregats (requereix ffmpeg) | `false` |
+
+### Opcions de `metadata`
+
+La comanda `metadata` escriu el JSON de metadades dels episodis i descarrega les imatges de portada d'una sèrie al directori indicat.
+
+| Opcio | Curt | Descripcio | Per defecte |
+|---|---|---|---|
+| `<SLUG>` | | Slug de la sèrie (veure mes avall) | *obligatori* |
+| `--directory` | `-d` | Directori on desar el JSON i les portades | *obligatori* |
 
 Per exemple, per descarregar una sèrie amb 4 capítols alhora en paral·lel:
 
 ```bash
-./cat_show_downloader bola-de-drac -d ~/Downloads/bola-de-drac/ -c 4
+./cat_show_downloader download bola-de-drac -d ~/Downloads/bola-de-drac/ -c 4
 ```
 
 Per descarregar una pel·lícula:
 
 ```bash
-./cat_show_downloader iron-man -d ~/Downloads/movies/
+./cat_show_downloader download iron-man -d ~/Downloads/movies/
 ```
 
 Per descarregar sense subtítols:
 
 ```bash
-./cat_show_downloader bola-de-drac -d ~/Downloads/bola-de-drac/ --skip-subtitles
+./cat_show_downloader download bola-de-drac -d ~/Downloads/bola-de-drac/ --skip-subtitles
+```
+
+Per desar les metadades dels episodis i les portades d'una sèrie:
+
+```bash
+./cat_show_downloader metadata bola-de-drac -d ~/Downloads/bola-de-drac/
 ```
 
 Per netejar els subtítols ja descarregats (elimina les capcaleres `Region:` no estàndard i els atributs `region:rN` de les linies de temps):
 
 ```bash
-./cat_show_downloader bola-de-drac -d ~/Downloads/bola-de-drac/ -f
+./cat_show_downloader download bola-de-drac -d ~/Downloads/bola-de-drac/ -f
 ```
 
 Per netejar i incrustar els subtítols existents directament als fitxers de video (requereix ffmpeg instal·lat):
 
 ```bash
-./cat_show_downloader bola-de-drac -d ~/Downloads/bola-de-drac/ --embed-existing-subtitles
+./cat_show_downloader download bola-de-drac -d ~/Downloads/bola-de-drac/ --embed-existing-subtitles
 ```
 
 ### Integració amb yt-dlp
@@ -107,7 +129,7 @@ Per exemple:
 - Si fos una sèrie de Super3, com per exemple https://www.3cat.cat/tv3/sx3/kuroko-basquet/, el "slug" seria `kuroko-basquet`.
 - Per a una pel·lícula, el "slug" es troba de la mateixa manera a la URL de la seva pagina a 3cat.cat.
 
-El programa detecta automaticament si el slug correspon a una sèrie o a una pel·lícula.
+La comanda `download` detecta automaticament si el slug correspon a una sèrie o a una pel·lícula; la comanda `metadata` només admet slugs de sèries.
 
 ### Problemes coneguts (i que probablement no solucionaré mai, per ser sincers)
 

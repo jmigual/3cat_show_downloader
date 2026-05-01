@@ -341,7 +341,11 @@ fn non_empty_file_exists(path: &str) -> bool {
     true
 }
 
-fn full_media_path(item: &MediaItem, directory: &str, extension: &str) -> Result<String> {
+pub(crate) fn full_media_path(
+    item: &MediaItem,
+    directory: &str,
+    extension: &str,
+) -> Result<String> {
     let path = std::path::Path::new(directory).join(item.filename(extension)?);
     path.to_str()
         .map(|s| s.to_string())
@@ -349,7 +353,7 @@ fn full_media_path(item: &MediaItem, directory: &str, extension: &str) -> Result
 }
 
 #[instrument(skip_all, fields(url, path))]
-async fn download_content(
+pub(crate) async fn download_content(
     url: &str,
     path: &str,
     label: &str,
@@ -423,6 +427,13 @@ async fn download_to_file(
         .await
         .map_err(|e| Error::Downloading(e.to_string()))?;
 
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::Downloading(format!(
+            "request failed with HTTP status {status}"
+        )));
+    }
+
     let mut file = File::create(path)
         .await
         .map_err(|e| Error::Downloading(e.to_string()))?;
@@ -459,14 +470,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use indicatif::MultiProgress;
+    use reqwest::Client;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        TEST_SINGLE_MEDIA_API_URL, builtin_media_is_complete, fetch_and_download_media,
-        find_existing_video_files, handle_missing_subtitles,
+        TEST_SINGLE_MEDIA_API_URL, builtin_media_is_complete, download_content,
+        fetch_and_download_media, find_existing_video_files, handle_missing_subtitles,
     };
     use crate::error::Error;
     use crate::http_client::{HttpClient, HttpClientTrait};
@@ -561,6 +573,35 @@ mod tests {
             format!("http://{address}/media?media=video&version=0s&idint={{id}}"),
             server,
         ))
+    }
+
+    async fn spawn_status_server(
+        status_code: u16,
+        body: &'static [u8],
+    ) -> io::Result<(String, JoinHandle<io::Result<()>>)> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await?;
+
+            let status_text = match status_code {
+                200 => "OK",
+                404 => "Not Found",
+                500 => "Internal Server Error",
+                _ => "Test Response",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.write_all(body).await?;
+            stream.shutdown().await
+        });
+
+        Ok((format!("http://{address}/cover.jpg"), server))
     }
 
     #[derive(Debug)]
@@ -818,5 +859,40 @@ mod tests {
             false,
             SubtitleMode::Embed,
         ));
+    }
+
+    #[tokio::test]
+    async fn test_should_not_leave_final_file_when_download_returns_http_error() {
+        let directory = create_test_directory("download_http_error");
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+
+        let (url, server) = spawn_status_server(404, b"not-found")
+            .await
+            .expect("test status server should start");
+        let destination = directory.join("cover.jpg");
+        let destination_str = destination
+            .to_str()
+            .expect("test directory path should be valid UTF-8");
+
+        let result = download_content(
+            &url,
+            destination_str,
+            "cover.jpg",
+            &MultiProgress::new(),
+            &Client::new(),
+        )
+        .await;
+
+        let server_result = server.await.expect("status server task should join");
+
+        assert!(matches!(
+            result,
+            Err(Error::Downloading(message)) if message.contains("HTTP status 404")
+        ));
+        assert!(server_result.is_ok());
+        assert!(!destination.exists());
+        assert!(!directory.join("cover.jpg.tmp").exists());
+
+        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
     }
 }

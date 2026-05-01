@@ -13,6 +13,7 @@ mod error;
 mod ffmpeg;
 mod http_client;
 mod media_resolver;
+mod metadata;
 mod models;
 mod movie;
 mod scheduler;
@@ -28,6 +29,7 @@ use tracing::{info, instrument, warn};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub use crate::cli::CatShowDownloaderArgs;
+use crate::cli::{Command, DownloadArgs, MetadataArgs};
 use crate::media_resolver::MediaType;
 use crate::models::{DownloadParams, MissingSubtitlePolicy, SubtitleMode};
 
@@ -124,6 +126,15 @@ fn resolve_subtitle_settings(
 #[allow(clippy::let_and_return)] // Binding needed to satisfy Rust 2024 tail-expression drop order rules
 #[instrument(skip_all)]
 pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> anyhow::Result<()> {
+    match args.command {
+        Command::Download(download_args) => run_download(download_args, multi_progress).await,
+        Command::Metadata(metadata_args) => run_metadata(metadata_args, multi_progress).await,
+    }
+}
+
+#[allow(clippy::let_and_return)] // Binding needed to satisfy Rust 2024 tail-expression drop order rules
+#[instrument(skip_all)]
+async fn run_download(args: DownloadArgs, multi_progress: MultiProgress) -> anyhow::Result<()> {
     if args.start_from_episode < 1 {
         anyhow::bail!(
             "start_from_episode must be at least 1, got {}",
@@ -132,7 +143,7 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
     }
 
     if args.fix_existing_subtitles {
-        subtitle_cleaner::fix_existing_subtitles(&args.directory)?;
+        subtitle_cleaner::fix_existing_subtitles(&args.target.directory)?;
     }
 
     let (ffmpeg_available, yt_dlp_available) =
@@ -144,11 +155,11 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
                 "--embed-existing-subtitles requires ffmpeg, but ffmpeg was not found on PATH"
             );
         }
-        ffmpeg::embed_existing_subtitles(&args.directory).await?;
+        ffmpeg::embed_existing_subtitles(&args.target.directory).await?;
     }
 
     let http_client = http_client::http_client();
-    let media = media_resolver::get_media_id(&args.slug).await?;
+    let media = media_resolver::get_media_id(&args.target.slug).await?;
 
     let (subtitle_mode, missing_subtitle_policy) = resolve_subtitle_settings(
         args.skip_subtitles,
@@ -172,7 +183,7 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
         missing_subtitle_policy,
         concurrent_downloads: args.concurrent_downloads,
         multi_progress,
-        directory: Arc::from(args.directory.as_str()),
+        directory: Arc::from(args.target.directory.as_str()),
         yt_dlp_available,
     };
 
@@ -182,6 +193,30 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
     };
 
     result
+}
+
+#[instrument(skip_all)]
+async fn run_metadata(args: MetadataArgs, multi_progress: MultiProgress) -> anyhow::Result<()> {
+    let http_client = http_client::http_client();
+    let media = media_resolver::get_media_id(&args.target.slug).await?;
+
+    let tv_show_id = match media {
+        MediaType::TvShow(id) => id,
+        MediaType::Movie { slug, .. } => {
+            anyhow::bail!(
+                "metadata subcommand only supports TV show slugs, but '{slug}' resolved to a movie"
+            );
+        }
+    };
+
+    metadata::write_tv_show_metadata(
+        http_client,
+        tv_show_id,
+        &args.target.slug,
+        &args.target.directory,
+        &multi_progress,
+    )
+    .await
 }
 
 #[cfg(test)]
