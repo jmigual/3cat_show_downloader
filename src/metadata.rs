@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument, warn};
 
 use crate::api_structs::{
-    MetadataDateValue, MetadataEpisode, MetadataEpisodesRoot, MetadataImage, Tv3Error,
+    MetadataDateValue, MetadataEpisode, MetadataEpisodesRoot, MetadataImage, MetadataSeason,
+    Tv3Error,
 };
 use crate::downloader;
 use crate::error::{Error, Result};
@@ -96,8 +97,12 @@ where
 
         output_entries.push(MetadataOutputEntry {
             title: metadata_episode.title,
+            description: metadata_episode.description,
+            duration: metadata_episode.duration,
             publication_date: metadata_episode.publication_date,
             emission_date: metadata_episode.emission_date,
+            season: metadata_episode.season,
+            episode_number_within_season: metadata_episode.episode_number_within_season,
             cover_path,
         });
     }
@@ -145,22 +150,32 @@ where
 #[derive(Debug, PartialEq, Eq)]
 struct ExtractedEpisodeMetadata {
     title: Option<String>,
+    description: Option<String>,
+    duration: Option<String>,
     publication_date: Option<String>,
     emission_date: Option<String>,
+    season: Option<String>,
+    episode_number_within_season: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct MetadataOutputEntry {
     title: Option<String>,
+    description: Option<String>,
+    duration: Option<String>,
     publication_date: Option<String>,
     emission_date: Option<String>,
+    season: Option<String>,
+    episode_number_within_season: Option<i32>,
     cover_path: Option<String>,
 }
 
 fn map_episode_metadata(episode: &MetadataEpisode) -> ExtractedEpisodeMetadata {
     ExtractedEpisodeMetadata {
         title: normalize_optional_string(episode.title.clone()),
+        description: normalize_optional_string(episode.description.clone()),
+        duration: normalize_optional_string(episode.duration.clone()),
         publication_date: episode
             .publication_date
             .clone()
@@ -171,7 +186,23 @@ fn map_episode_metadata(episode: &MetadataEpisode) -> ExtractedEpisodeMetadata {
             .clone()
             .and_then(MetadataDateValue::into_output_string)
             .and_then(normalize_string),
+        season: extract_season(&episode.seasons),
+        episode_number_within_season: episode.season_episode_number,
     }
+}
+
+fn extract_season(seasons: &[MetadataSeason]) -> Option<String> {
+    seasons
+        .iter()
+        .find(|season| season.main)
+        .or_else(|| seasons.first())
+        .and_then(|season| {
+            season
+                .description
+                .clone()
+                .and_then(normalize_string)
+                .or_else(|| normalize_string(season.id.clone()))
+        })
 }
 
 fn media_item_from_episode(episode: &MetadataEpisode) -> MediaItem {
@@ -281,6 +312,8 @@ mod tests {
             permatitle: "fallback-title".to_string(),
             title: Some("Episode title".to_string()),
             tv_show_name: "Sample show".to_string(),
+            description: Some(" Episode description ".to_string()),
+            duration: Some(" 00:08:44:21 ".to_string()),
             publication_date: Some(MetadataDateValue::Text("2024-01-01".to_string())),
             emission_date: Some(MetadataDateValue::Structured(
                 crate::api_structs::MetadataDateFields {
@@ -288,6 +321,12 @@ mod tests {
                     utc: Some("2024-02-01T00:00:00Z".to_string()),
                 },
             )),
+            season_episode_number: Some(4),
+            seasons: vec![MetadataSeason {
+                id: "PUTEMP_26".to_string(),
+                description: Some("26a Temporada".to_string()),
+                main: true,
+            }],
             images: vec![
                 MetadataImage {
                     size: Some("small".to_string()),
@@ -306,8 +345,12 @@ mod tests {
             map_episode_metadata(&episode),
             ExtractedEpisodeMetadata {
                 title: Some("Episode title".to_string()),
+                description: Some("Episode description".to_string()),
+                duration: Some("00:08:44:21".to_string()),
                 publication_date: Some("2024-01-01".to_string()),
                 emission_date: Some("2024-02-01T00:00:00Z".to_string()),
+                season: Some("26a Temporada".to_string()),
+                episode_number_within_season: Some(4),
             }
         );
         assert_eq!(
@@ -353,8 +396,18 @@ mod tests {
                             "permatitle": "episode-one",
                             "titol": "Episode One",
                             "programa": "Sample Show",
+                            "entradeta": "Episode summary",
+                            "durada": "00:08:44:21",
                             "data_publicacio": "2024-01-01",
                             "data_emissio": null,
+                            "capitol_temporada": 8,
+                            "temporades": [
+                                {
+                                    "id": "PUTEMP_26",
+                                    "desc": "26a Temporada",
+                                    "main": true
+                                }
+                            ],
                             "imatges": [
                                 {
                                     "mida": "1014x570",
@@ -372,6 +425,26 @@ mod tests {
             serde_json::from_str(response_json).expect("metadata response should parse");
 
         assert_eq!(response.response.items.item.len(), 1);
+        assert_eq!(
+            response.response.items.item[0].description.as_deref(),
+            Some("Episode summary")
+        );
+        assert_eq!(
+            response.response.items.item[0].duration.as_deref(),
+            Some("00:08:44:21")
+        );
+        assert_eq!(
+            response.response.items.item[0].season_episode_number,
+            Some(8)
+        );
+        assert_eq!(
+            response.response.items.item[0].seasons,
+            vec![MetadataSeason {
+                id: "PUTEMP_26".to_string(),
+                description: Some("26a Temporada".to_string()),
+                main: true,
+            }]
+        );
         assert_eq!(
             response.response.items.item[0].images,
             vec![MetadataImage {
@@ -401,8 +474,14 @@ mod tests {
                                 "permatitle": "episode-one",
                                 "titol": "Episode One",
                                 "programa": "Sample Show",
+                                "entradeta": "Episode One summary",
+                                "durada": "00:08:44:21",
                                 "data_publicacio": {{ "utc": "2024-01-01T00:00:00Z" }},
                                 "data_emissio": "2024-01-02",
+                                "capitol_temporada": 4,
+                                "temporades": [
+                                    {{ "id": "PUTEMP_26", "desc": "26a Temporada", "main": true }}
+                                ],
                                 "imatges": [
                                     {{ "mida": "small", "rel_name": "KEYVIDEO", "url": "{cover_url}" }},
                                     {{ "mida": "master", "rel_name": "KEYVIDEO", "url": "{cover_url}" }}
@@ -414,8 +493,14 @@ mod tests {
                                 "permatitle": "episode-two",
                                 "titol": "",
                                 "programa": "Sample Show",
+                                "entradeta": "  ",
+                                "durada": "  ",
                                 "data_publicacio": null,
                                 "data_emissio": {{ "text": "03/01/2024" }},
+                                "capitol_temporada": null,
+                                "temporades": [
+                                    {{ "id": "PUTEMP_26", "desc": "26a Temporada", "main": true }}
+                                ],
                                 "imatges": [
                                     {{ "mida": "master", "rel_name": "OTHER", "url": "{cover_url}" }}
                                 ]
@@ -454,17 +539,28 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].title.as_deref(), Some("Episode One"));
         assert_eq!(
+            entries[0].description.as_deref(),
+            Some("Episode One summary")
+        );
+        assert_eq!(entries[0].duration.as_deref(), Some("00:08:44:21"));
+        assert_eq!(
             entries[0].publication_date.as_deref(),
             Some("2024-01-01T00:00:00Z")
         );
         assert_eq!(entries[0].emission_date.as_deref(), Some("2024-01-02"));
+        assert_eq!(entries[0].season.as_deref(), Some("26a Temporada"));
+        assert_eq!(entries[0].episode_number_within_season, Some(4));
         assert_eq!(
             entries[0].cover_path.as_deref(),
             Some("1-episode-one-cover-101.jpg")
         );
         assert_eq!(entries[1].title, None);
+        assert_eq!(entries[1].description, None);
+        assert_eq!(entries[1].duration, None);
         assert_eq!(entries[1].publication_date, None);
         assert_eq!(entries[1].emission_date.as_deref(), Some("03/01/2024"));
+        assert_eq!(entries[1].season.as_deref(), Some("26a Temporada"));
+        assert_eq!(entries[1].episode_number_within_season, None);
         assert_eq!(entries[1].cover_path, None);
 
         let saved_cover_path = temp_dir.join("1-episode-one-cover-101.jpg");
@@ -495,8 +591,14 @@ mod tests {
                                 "permatitle": "episode-one",
                                 "titol": "Episode One",
                                 "programa": "Sample Show",
+                                "entradeta": "Episode One summary",
+                                "durada": "00:08:44:21",
                                 "data_publicacio": {{ "utc": "2024-01-01T00:00:00Z" }},
                                 "data_emissio": "2024-01-02",
+                                "capitol_temporada": 4,
+                                "temporades": [
+                                    {{ "id": "PUTEMP_26", "desc": "26a Temporada", "main": true }}
+                                ],
                                 "imatges": [
                                     {{ "mida": "master", "rel_name": "KEYVIDEO", "url": "{cover_url}" }}
                                 ]
@@ -534,6 +636,13 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title.as_deref(), Some("Episode One"));
+        assert_eq!(
+            entries[0].description.as_deref(),
+            Some("Episode One summary")
+        );
+        assert_eq!(entries[0].duration.as_deref(), Some("00:08:44:21"));
+        assert_eq!(entries[0].season.as_deref(), Some("26a Temporada"));
+        assert_eq!(entries[0].episode_number_within_season, Some(4));
         assert_eq!(entries[0].cover_path, None);
         assert!(!temp_dir.join("1-episode-one-cover-101.jpg").exists());
 

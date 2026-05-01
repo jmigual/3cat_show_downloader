@@ -86,15 +86,40 @@ pub struct MetadataEpisode {
     /// Name of the TV show this episode belongs to.
     #[serde(rename = "programa")]
     pub tv_show_name: String,
+    /// Episode description or summary.
+    #[serde(rename = "entradeta")]
+    pub description: Option<String>,
+    /// Episode duration as provided by the API payload.
+    #[serde(rename = "durada")]
+    pub duration: Option<String>,
     /// Publication date payload.
     #[serde(rename = "data_publicacio")]
     pub publication_date: Option<MetadataDateValue>,
     /// Emission date payload.
     #[serde(rename = "data_emissio")]
     pub emission_date: Option<MetadataDateValue>,
+    /// Episode number within the season.
+    #[serde(rename = "capitol_temporada")]
+    pub season_episode_number: Option<i32>,
+    /// Season entries attached to the episode.
+    #[serde(default, rename = "temporades")]
+    pub seasons: Vec<MetadataSeason>,
     /// Episode image variants.
     #[serde(default, rename = "imatges")]
     pub images: Vec<MetadataImage>,
+}
+
+/// Season entry attached to an episode.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct MetadataSeason {
+    /// Stable season identifier.
+    pub id: String,
+    /// Human-readable season label.
+    #[serde(rename = "desc")]
+    pub description: Option<String>,
+    /// Whether this season is the main one for the episode.
+    #[serde(default)]
+    pub main: bool,
 }
 
 /// Date value returned by 3cat APIs.
