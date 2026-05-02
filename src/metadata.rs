@@ -856,8 +856,7 @@ mod tests {
     #[test]
     fn test_should_sort_entries_by_season_then_episode_number() {
         // Create test entries with various combinations of seasons and episode numbers
-        let mut entries = vec![
-            MetadataOutputEntry {
+        let mut entries = [MetadataOutputEntry {
                 title: Some("S1E3".to_string()),
                 description: None,
                 duration: None,
@@ -906,8 +905,7 @@ mod tests {
                 season: Some("2a Temporada".to_string()),
                 episode_number_within_season: Some(1),
                 cover_path: None,
-            },
-        ];
+            }];
 
         // Apply the sorting logic from the metadata writing function
         entries.sort_by(|a, b| {
