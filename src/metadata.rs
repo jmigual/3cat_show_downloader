@@ -107,6 +107,39 @@ where
         });
     }
 
+    // Sort entries by season (primary), then by episode_number_within_season (secondary)
+    output_entries.sort_by(|a, b| {
+        match (&a.season, &b.season) {
+            (Some(season_a), Some(season_b)) => {
+                // Try to extract numeric values for proper numeric comparison
+                let num_a = extract_season_number(season_a);
+                let num_b = extract_season_number(season_b);
+
+                match (num_a, num_b) {
+                    (Some(a_num), Some(b_num)) => match a_num.cmp(&b_num) {
+                        std::cmp::Ordering::Equal => {
+                            // Same season, compare by episode number
+                            a.episode_number_within_season.cmp(&b.episode_number_within_season)
+                        }
+                        ordering => ordering,
+                    },
+                    _ => {
+                        // Fallback to string comparison
+                        match season_a.cmp(season_b) {
+                            std::cmp::Ordering::Equal => {
+                                a.episode_number_within_season.cmp(&b.episode_number_within_season)
+                            }
+                            ordering => ordering,
+                        }
+                    }
+                }
+            }
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => a.episode_number_within_season.cmp(&b.episode_number_within_season),
+        }
+    });
+
     let metadata_file_path = metadata_file_path(directory, slug);
     let serialized = serde_json::to_vec_pretty(&output_entries)
         .context("failed to serialize metadata manifest to JSON")?;
@@ -303,6 +336,23 @@ fn normalize_string(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Extracts the first numeric value from a season string.
+///
+/// This function attempts to parse the first sequence of digits found in the
+/// season string. For example:
+/// - "26a Temporada" -> Some(26)
+/// - "PUTEMP_26" -> Some(26)
+/// - "Season 1" -> Some(1)
+/// - "no digits" -> None
+fn extract_season_number(season: &str) -> Option<u32> {
+    season
+        .chars()
+        .collect::<String>()
+        .split(|c: char| !c.is_numeric())
+        .find(|s| !s.is_empty())
+        .and_then(|num_str| num_str.parse().ok())
 }
 
 #[cfg(test)]
@@ -550,31 +600,35 @@ mod tests {
             serde_json::from_str(&metadata_json).expect("metadata JSON should parse");
 
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].title.as_deref(), Some("Episode One"));
+        // After sorting by season then episode_number_within_season:
+        // Entry 0: Episode 102 (episode_number_within_season: None)
+        // Entry 1: Episode 101 (episode_number_within_season: Some(4))
+        assert_eq!(entries[0].title, None);
+        assert_eq!(entries[0].description, None);
+        assert_eq!(entries[0].duration, None);
+        assert_eq!(entries[0].publication_date, None);
+        assert_eq!(entries[0].emission_date.as_deref(), Some("03/01/2024"));
+        assert_eq!(entries[0].season.as_deref(), Some("26a Temporada"));
+        assert_eq!(entries[0].episode_number_within_season, None);
+        assert_eq!(entries[0].cover_path, None);
+
+        assert_eq!(entries[1].title.as_deref(), Some("Episode One"));
         assert_eq!(
-            entries[0].description.as_deref(),
+            entries[1].description.as_deref(),
             Some("Episode One summary")
         );
-        assert_eq!(entries[0].duration.as_deref(), Some("00:08:44:21"));
+        assert_eq!(entries[1].duration.as_deref(), Some("00:08:44:21"));
         assert_eq!(
-            entries[0].publication_date.as_deref(),
+            entries[1].publication_date.as_deref(),
             Some("2024-01-01T00:00:00Z")
         );
-        assert_eq!(entries[0].emission_date.as_deref(), Some("2024-01-02"));
-        assert_eq!(entries[0].season.as_deref(), Some("26a Temporada"));
-        assert_eq!(entries[0].episode_number_within_season, Some(4));
+        assert_eq!(entries[1].emission_date.as_deref(), Some("2024-01-02"));
+        assert_eq!(entries[1].season.as_deref(), Some("26a Temporada"));
+        assert_eq!(entries[1].episode_number_within_season, Some(4));
         assert_eq!(
-            entries[0].cover_path.as_deref(),
+            entries[1].cover_path.as_deref(),
             Some("1-episode-one-cover-101.jpg")
         );
-        assert_eq!(entries[1].title, None);
-        assert_eq!(entries[1].description, None);
-        assert_eq!(entries[1].duration, None);
-        assert_eq!(entries[1].publication_date, None);
-        assert_eq!(entries[1].emission_date.as_deref(), Some("03/01/2024"));
-        assert_eq!(entries[1].season.as_deref(), Some("26a Temporada"));
-        assert_eq!(entries[1].episode_number_within_season, None);
-        assert_eq!(entries[1].cover_path, None);
 
         let saved_cover_path = temp_dir.join("1-episode-one-cover-101.jpg");
         let saved_cover = tokio::fs::read(saved_cover_path)
@@ -787,4 +841,110 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("cat_show_downloader-{prefix}-{timestamp}"))
     }
+
+    #[test]
+    fn test_should_extract_numeric_season_values() {
+        assert_eq!(extract_season_number("26a Temporada"), Some(26));
+        assert_eq!(extract_season_number("PUTEMP_26"), Some(26));
+        assert_eq!(extract_season_number("Season 1"), Some(1));
+        assert_eq!(extract_season_number("1"), Some(1));
+        assert_eq!(extract_season_number("Season 123"), Some(123));
+        assert_eq!(extract_season_number("no digits"), None);
+        assert_eq!(extract_season_number(""), None);
+    }
+
+    #[test]
+    fn test_should_sort_entries_by_season_then_episode_number() {
+        // Create test entries with various combinations of seasons and episode numbers
+        let mut entries = vec![
+            MetadataOutputEntry {
+                title: Some("S1E3".to_string()),
+                description: None,
+                duration: None,
+                publication_date: None,
+                emission_date: None,
+                season: Some("1a Temporada".to_string()),
+                episode_number_within_season: Some(3),
+                cover_path: None,
+            },
+            MetadataOutputEntry {
+                title: Some("S1E1".to_string()),
+                description: None,
+                duration: None,
+                publication_date: None,
+                emission_date: None,
+                season: Some("1a Temporada".to_string()),
+                episode_number_within_season: Some(1),
+                cover_path: None,
+            },
+            MetadataOutputEntry {
+                title: Some("S2E2".to_string()),
+                description: None,
+                duration: None,
+                publication_date: None,
+                emission_date: None,
+                season: Some("2a Temporada".to_string()),
+                episode_number_within_season: Some(2),
+                cover_path: None,
+            },
+            MetadataOutputEntry {
+                title: Some("S1E2".to_string()),
+                description: None,
+                duration: None,
+                publication_date: None,
+                emission_date: None,
+                season: Some("1a Temporada".to_string()),
+                episode_number_within_season: Some(2),
+                cover_path: None,
+            },
+            MetadataOutputEntry {
+                title: Some("S2E1".to_string()),
+                description: None,
+                duration: None,
+                publication_date: None,
+                emission_date: None,
+                season: Some("2a Temporada".to_string()),
+                episode_number_within_season: Some(1),
+                cover_path: None,
+            },
+        ];
+
+        // Apply the sorting logic from the metadata writing function
+        entries.sort_by(|a, b| {
+            match (&a.season, &b.season) {
+                (Some(season_a), Some(season_b)) => {
+                    let num_a = extract_season_number(season_a);
+                    let num_b = extract_season_number(season_b);
+
+                    match (num_a, num_b) {
+                        (Some(a_num), Some(b_num)) => match a_num.cmp(&b_num) {
+                            std::cmp::Ordering::Equal => {
+                                a.episode_number_within_season.cmp(&b.episode_number_within_season)
+                            }
+                            ordering => ordering,
+                        },
+                        _ => {
+                            match season_a.cmp(season_b) {
+                                std::cmp::Ordering::Equal => {
+                                    a.episode_number_within_season.cmp(&b.episode_number_within_season)
+                                }
+                                ordering => ordering,
+                            }
+                        }
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (None, None) => a.episode_number_within_season.cmp(&b.episode_number_within_season),
+            }
+        });
+
+        // Verify the sort order
+        assert_eq!(entries[0].title.as_deref(), Some("S1E1"));
+        assert_eq!(entries[1].title.as_deref(), Some("S1E2"));
+        assert_eq!(entries[2].title.as_deref(), Some("S1E3"));
+        assert_eq!(entries[3].title.as_deref(), Some("S2E1"));
+        assert_eq!(entries[4].title.as_deref(), Some("S2E2"));
+    }
 }
+
