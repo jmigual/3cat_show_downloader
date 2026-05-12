@@ -33,6 +33,7 @@ rust_2024_compatibility = "warn"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1.7.1"
 indicatif = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

@@ -1,6 +1,6 @@
 //! Command-line argument definitions for the 3cat media downloader.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Command-line arguments for the 3cat media downloader.
 #[derive(Parser, Debug)]
@@ -17,6 +17,13 @@ pub(crate) enum Command {
     Download(DownloadArgs),
     /// Retrieve episode metadata and assets without downloading video files.
     Metadata(MetadataArgs),
+}
+
+/// Image formatting modes available for metadata asset downloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MetadataImageFormat {
+    /// Resize images to the TMDB-compatible format.
+    Tmdb,
 }
 
 /// Target selection options for commands that operate on a TV show or movie slug.
@@ -77,13 +84,17 @@ pub(crate) struct DownloadArgs {
 pub(crate) struct MetadataArgs {
     #[command(flatten)]
     pub(crate) target: MetadataTargetArgs,
+
+    /// Resize downloaded images to a predefined format.
+    #[arg(long, value_enum)]
+    pub(crate) image_format: Option<MetadataImageFormat>,
 }
 
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{CatShowDownloaderArgs, Command};
+    use super::{CatShowDownloaderArgs, Command, MetadataImageFormat};
 
     #[test]
     fn test_should_parse_download_subcommand_with_allow_missing_subtitles_flag() {
@@ -140,6 +151,26 @@ mod tests {
 
         assert_eq!(metadata_args.target.slug, "bola-de-drac");
         assert_eq!(metadata_args.target.directory, "output");
+        assert_eq!(metadata_args.image_format, None);
+    }
+
+    #[test]
+    fn test_should_parse_metadata_subcommand_with_tmdb_image_format() {
+        let args = CatShowDownloaderArgs::parse_from([
+            "cat_show_downloader",
+            "metadata",
+            "bola-de-drac",
+            "--directory",
+            "output",
+            "--image-format",
+            "tmdb",
+        ]);
+
+        let Command::Metadata(metadata_args) = args.command else {
+            panic!("expected metadata subcommand");
+        };
+
+        assert_eq!(metadata_args.image_format, Some(MetadataImageFormat::Tmdb));
     }
 
     #[test]

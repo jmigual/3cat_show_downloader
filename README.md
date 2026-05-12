@@ -51,6 +51,7 @@ La comanda `metadata` escriu el JSON de metadades dels episodis i descarrega les
 |---|---|---|---|
 | `<SLUG>` | | Slug de la sèrie (veure mes avall) | *obligatori* |
 | `--directory` | `-d` | Directori on desar el JSON i les portades | *obligatori* |
+| `--image-format` | | Reformatar les portades descarregades. El valor `tmdb` genera JPEGs a 1280x720 amb retall centrat | sense canvis |
 
 Per exemple, per descarregar una sèrie amb 4 capítols alhora en paral·lel:
 
@@ -74,6 +75,12 @@ Per desar les metadades dels episodis i les portades d'una sèrie:
 
 ```bash
 ./cat_show_downloader metadata bola-de-drac -d ~/Downloads/bola-de-drac/
+```
+
+Per desar les metadades i convertir les portades al format compatible amb TMDB (JPEG 1280x720 amb auto-orientacio i retall centrat):
+
+```bash
+./cat_show_downloader metadata bola-de-drac -d ~/Downloads/bola-de-drac/ --image-format tmdb
 ```
 
 Per netejar els subtítols ja descarregats (elimina les capcaleres `Region:` no estàndard i els atributs `region:rN` de les linies de temps):

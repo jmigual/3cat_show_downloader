@@ -1,9 +1,15 @@
 //! Episode metadata retrieval and persistence workflow for TV shows.
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{
+    DynamicImage, ExtendedColorType, GenericImageView, ImageDecoder, ImageEncoder, ImageReader,
+};
 use indicatif::MultiProgress;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -13,6 +19,7 @@ use crate::api_structs::{
     MetadataDateValue, MetadataEpisode, MetadataEpisodesRoot, MetadataImage, MetadataSeason,
     Tv3Error,
 };
+use crate::cli::MetadataImageFormat;
 use crate::downloader;
 use crate::error::{Error, Result};
 use crate::http_client::{HttpClient, HttpClientTrait};
@@ -21,6 +28,9 @@ use crate::models::MediaItem;
 const TV3_EPISODE_LIST_URL: &str = "https://www.3cat.cat/api/3cat/dades/?queryKey=%5B%22tira%22%2C%7B%22url%22%3A%22%2F%2Fapi.3cat.cat%2Fvideos%3F_format%3Djson%26no_agrupacio%3DPUAGR_LLSIGN%26tipus_contingut%3DPPD%26items_pagina%3D1500%26pagina%3D1%26sdom%3Dimg%26version%3D2.0%26cache%3D180%26https%3Dtrue%26master%3Dyes%26programatv_id%3D{tv_show_id}%26origen%3Dauto%26perfil%3Dpc%22%7D%5D";
 const METADATA_FILE_SUFFIX: &str = "metadata";
 const DEFAULT_COVER_EXTENSION: &str = "jpg";
+const TMDB_COVER_WIDTH: u32 = 1280;
+const TMDB_COVER_HEIGHT: u32 = 720;
+const TMDB_JPEG_QUALITY: u8 = 90;
 
 /// Fetches episode metadata for a TV show and writes the metadata manifest and covers.
 #[allow(clippy::let_and_return)] // Binding needed to satisfy Rust 2024 tail-expression drop order rules
@@ -30,6 +40,7 @@ pub(crate) async fn write_tv_show_metadata(
     tv_show_id: i32,
     slug: &str,
     directory: &str,
+    image_format: Option<MetadataImageFormat>,
     multi_progress: &MultiProgress,
 ) -> anyhow::Result<()> {
     let download_client = http_client.inner().clone();
@@ -40,6 +51,7 @@ pub(crate) async fn write_tv_show_metadata(
         tv_show_id,
         slug,
         directory,
+        image_format,
         multi_progress,
     )
     .await;
@@ -51,12 +63,14 @@ pub(crate) async fn write_tv_show_metadata(
     skip(http_client, download_client, multi_progress),
     fields(tv_show_id, slug, directory)
 )]
+#[allow(clippy::too_many_arguments)]
 async fn write_tv_show_metadata_with_clients<T>(
     http_client: Arc<T>,
     download_client: &Client,
     tv_show_id: i32,
     slug: &str,
     directory: &str,
+    image_format: Option<MetadataImageFormat>,
     multi_progress: &MultiProgress,
 ) -> anyhow::Result<()>
 where
@@ -79,6 +93,7 @@ where
                 &media_item,
                 directory,
                 cover_url,
+                image_format,
             )
             .await
             {
@@ -119,16 +134,17 @@ where
                     (Some(a_num), Some(b_num)) => match a_num.cmp(&b_num) {
                         std::cmp::Ordering::Equal => {
                             // Same season, compare by episode number
-                            a.episode_number_within_season.cmp(&b.episode_number_within_season)
+                            a.episode_number_within_season
+                                .cmp(&b.episode_number_within_season)
                         }
                         ordering => ordering,
                     },
                     _ => {
                         // Fallback to string comparison
                         match season_a.cmp(season_b) {
-                            std::cmp::Ordering::Equal => {
-                                a.episode_number_within_season.cmp(&b.episode_number_within_season)
-                            }
+                            std::cmp::Ordering::Equal => a
+                                .episode_number_within_season
+                                .cmp(&b.episode_number_within_season),
                             ordering => ordering,
                         }
                     }
@@ -136,7 +152,9 @@ where
             }
             (Some(_), None) => std::cmp::Ordering::Greater,
             (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => a.episode_number_within_season.cmp(&b.episode_number_within_season),
+            (None, None) => a
+                .episode_number_within_season
+                .cmp(&b.episode_number_within_season),
         }
     });
 
@@ -277,8 +295,9 @@ async fn download_cover(
     item: &MediaItem,
     directory: &str,
     cover_url: &str,
+    image_format: Option<MetadataImageFormat>,
 ) -> Result<String> {
-    let extension = extension_from_url(cover_url);
+    let extension = output_extension_for_format(cover_url, image_format);
     let file_name = format!("{}-cover-{}.{}", item.filename_stem()?, item.id, extension);
     let output_path = Path::new(directory).join(&file_name);
 
@@ -294,20 +313,124 @@ async fn download_cover(
         return Ok(file_name);
     }
 
-    let output_path_str = output_path
-        .to_str()
-        .ok_or_else(|| Error::InvalidPathEncoding(output_path.display().to_string()))?;
+    match image_format {
+        None => {
+            let output_path_str = output_path
+                .to_str()
+                .ok_or_else(|| Error::InvalidPathEncoding(output_path.display().to_string()))?;
 
-    downloader::download_content(
-        cover_url,
-        output_path_str,
-        &file_name,
-        multi_progress,
-        client,
-    )
-    .await?;
+            downloader::download_content(
+                cover_url,
+                output_path_str,
+                &file_name,
+                multi_progress,
+                client,
+            )
+            .await?;
+        }
+        Some(MetadataImageFormat::Tmdb) => {
+            let encoded_image = download_and_transform_tmdb_cover(
+                client,
+                cover_url,
+                &file_name,
+                &output_path,
+                multi_progress,
+            )
+            .await?;
+            tokio::fs::write(&output_path, encoded_image)
+                .await
+                .map_err(|error| Error::Downloading(error.to_string()))?;
+        }
+    }
 
     Ok(file_name)
+}
+
+async fn download_and_transform_tmdb_cover(
+    client: &Client,
+    cover_url: &str,
+    label: &str,
+    output_path: &Path,
+    multi_progress: &MultiProgress,
+) -> Result<Vec<u8>> {
+    let source_path = output_path.with_extension("source");
+    let source_path_str = source_path
+        .to_str()
+        .ok_or_else(|| Error::InvalidPathEncoding(source_path.display().to_string()))?;
+
+    downloader::download_content(cover_url, source_path_str, label, multi_progress, client).await?;
+
+    let result = async {
+        let image_bytes = tokio::fs::read(&source_path)
+            .await
+            .map_err(|error| Error::Downloading(error.to_string()))?;
+
+        transform_cover_to_tmdb_jpeg(&image_bytes)
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&source_path).await;
+
+    result
+}
+
+fn transform_cover_to_tmdb_jpeg(image_bytes: &[u8]) -> Result<Vec<u8>> {
+    let reader = ImageReader::new(Cursor::new(image_bytes))
+        .with_guessed_format()
+        .map_err(|error| Error::Downloading(error.to_string()))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| Error::Downloading(error.to_string()))?;
+    let orientation = decoder
+        .orientation()
+        .map_err(|error| Error::Downloading(error.to_string()))?;
+    let mut image = DynamicImage::from_decoder(decoder)
+        .map_err(|error| Error::Downloading(error.to_string()))?;
+    image.apply_orientation(orientation);
+
+    let transformed = resize_and_center_crop(image, TMDB_COVER_WIDTH, TMDB_COVER_HEIGHT);
+
+    encode_as_jpeg(&transformed)
+}
+
+fn resize_and_center_crop(
+    image: DynamicImage,
+    target_width: u32,
+    target_height: u32,
+) -> DynamicImage {
+    let (width, height) = image.dimensions();
+    let scale = f64::max(
+        f64::from(target_width) / f64::from(width),
+        f64::from(target_height) / f64::from(height),
+    );
+    let resized_width = (f64::from(width) * scale).ceil() as u32;
+    let resized_height = (f64::from(height) * scale).ceil() as u32;
+
+    let resized = image.resize_exact(resized_width, resized_height, FilterType::Lanczos3);
+    let crop_x = (resized_width - target_width) / 2;
+    let crop_y = (resized_height - target_height) / 2;
+
+    resized.crop_imm(crop_x, crop_y, target_width, target_height)
+}
+
+fn encode_as_jpeg(image: &DynamicImage) -> Result<Vec<u8>> {
+    let rgb_image = image.to_rgb8();
+    let (width, height) = rgb_image.dimensions();
+    let mut encoded = Vec::new();
+    let encoder = JpegEncoder::new_with_quality(&mut encoded, TMDB_JPEG_QUALITY);
+
+    encoder
+        .write_image(rgb_image.as_raw(), width, height, ExtendedColorType::Rgb8)
+        .map_err(|error| Error::Downloading(error.to_string()))?;
+
+    Ok(encoded)
+}
+
+fn output_extension_for_format(url: &str, image_format: Option<MetadataImageFormat>) -> String {
+    match image_format {
+        Some(MetadataImageFormat::Tmdb) => DEFAULT_COVER_EXTENSION.to_string(),
+        None => extension_from_url(url),
+    }
 }
 
 fn extension_from_url(url: &str) -> String {
@@ -357,9 +480,11 @@ fn extract_season_number(season: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba};
     use indicatif::MultiProgress;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -585,6 +710,7 @@ mod tests {
             temp_dir
                 .to_str()
                 .expect("temp dir path should be valid utf-8"),
+            None,
             &MultiProgress::new(),
         )
         .await
@@ -687,6 +813,7 @@ mod tests {
             temp_dir
                 .to_str()
                 .expect("temp dir path should be valid utf-8"),
+            None,
             &MultiProgress::new(),
         )
         .await
@@ -766,10 +893,170 @@ mod tests {
             temp_dir
                 .to_str()
                 .expect("temp dir path should be valid utf-8"),
+            None,
             &MultiProgress::new(),
         )
         .await
         .expect("metadata workflow should reuse existing cover");
+
+        let metadata_path = temp_dir.join("sample-show-metadata.json");
+        let metadata_json = tokio::fs::read_to_string(&metadata_path)
+            .await
+            .expect("metadata file should be readable");
+        let entries: Vec<MetadataOutputEntry> =
+            serde_json::from_str(&metadata_json).expect("metadata JSON should parse");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cover_path.as_deref(), Some(existing_cover_name));
+
+        let saved_cover = tokio::fs::read(&existing_cover_path)
+            .await
+            .expect("existing cover should still be readable");
+        assert_eq!(saved_cover, existing_cover_bytes);
+
+        std::fs::remove_dir_all(&temp_dir).expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_should_write_tmdb_cover_as_exact_1280x720_jpeg() {
+        let temp_dir = unique_test_directory("metadata-cover-tmdb");
+        std::fs::create_dir_all(&temp_dir).expect("test directory should be created");
+
+        let image_bytes = png_test_image_bytes(800, 1200);
+        let (server_handle, cover_url) = start_single_response_server(image_bytes).await;
+        let cover_url = cover_url.replace("/cover.jpg", "/cover.png");
+
+        let response_json = format!(
+            r#"{{
+                "resposta": {{
+                    "items": {{
+                        "item": [
+                            {{
+                                "id": 101,
+                                "capitol": 1,
+                                "permatitle": "episode-one",
+                                "titol": "Episode One",
+                                "programa": "Sample Show",
+                                "entradeta": "Episode One summary",
+                                "durada": "00:08:44:21",
+                                "data_publicacio": {{ "utc": "2024-01-01T00:00:00Z" }},
+                                "data_emissio": "2024-01-02",
+                                "capitol_temporada": 4,
+                                "temporades": [
+                                    {{ "id": "PUTEMP_26", "desc": "26a Temporada", "main": true }}
+                                ],
+                                "imatges": [
+                                    {{ "mida": "master", "rel_name": "KEYVIDEO", "url": "{cover_url}" }}
+                                ]
+                            }}
+                        ]
+                    }}
+                }}
+            }}"#
+        );
+
+        let http_client = Arc::new(MockHttpClient::new(vec![response_json.as_str()]));
+        let reqwest_client = Client::new();
+
+        write_tv_show_metadata_with_clients(
+            http_client,
+            &reqwest_client,
+            777,
+            "sample-show",
+            temp_dir
+                .to_str()
+                .expect("temp dir path should be valid utf-8"),
+            Some(MetadataImageFormat::Tmdb),
+            &MultiProgress::new(),
+        )
+        .await
+        .expect("metadata workflow should succeed");
+
+        server_handle.await.expect("server task should complete");
+
+        let metadata_path = temp_dir.join("sample-show-metadata.json");
+        let metadata_json = tokio::fs::read_to_string(&metadata_path)
+            .await
+            .expect("metadata file should be readable");
+        let entries: Vec<MetadataOutputEntry> =
+            serde_json::from_str(&metadata_json).expect("metadata JSON should parse");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].cover_path.as_deref(),
+            Some("1-episode-one-cover-101.jpg")
+        );
+
+        let saved_cover_path = temp_dir.join("1-episode-one-cover-101.jpg");
+        let saved_cover = tokio::fs::read(saved_cover_path)
+            .await
+            .expect("cover file should exist");
+        assert_eq!(
+            image::guess_format(&saved_cover).expect("format should be detectable"),
+            ImageFormat::Jpeg
+        );
+
+        let decoded = image::load_from_memory(&saved_cover).expect("saved JPEG should decode");
+        assert_eq!(decoded.dimensions(), (TMDB_COVER_WIDTH, TMDB_COVER_HEIGHT));
+
+        std::fs::remove_dir_all(&temp_dir).expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_should_not_download_tmdb_cover_when_jpg_destination_already_exists() {
+        let temp_dir = unique_test_directory("metadata-cover-existing-tmdb-file");
+        std::fs::create_dir_all(&temp_dir).expect("test directory should be created");
+
+        let existing_cover_name = "1-episode-one-cover-101.jpg";
+        let existing_cover_path = temp_dir.join(existing_cover_name);
+        let existing_cover_bytes = b"existing-jpg-cover";
+        tokio::fs::write(&existing_cover_path, existing_cover_bytes)
+            .await
+            .expect("existing cover should be written");
+
+        let response_json = r#"{
+            "resposta": {
+                "items": {
+                    "item": [
+                        {
+                            "id": 101,
+                            "capitol": 1,
+                            "permatitle": "episode-one",
+                            "titol": "Episode One",
+                            "programa": "Sample Show",
+                            "entradeta": "Episode One summary",
+                            "durada": "00:08:44:21",
+                            "data_publicacio": { "utc": "2024-01-01T00:00:00Z" },
+                            "data_emissio": "2024-01-02",
+                            "capitol_temporada": 4,
+                            "temporades": [
+                                { "id": "PUTEMP_26", "desc": "26a Temporada", "main": true }
+                            ],
+                            "imatges": [
+                                { "mida": "master", "rel_name": "KEYVIDEO", "url": "http://127.0.0.1:9/cover.png" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let http_client = Arc::new(MockHttpClient::new(vec![response_json]));
+        let reqwest_client = Client::new();
+
+        write_tv_show_metadata_with_clients(
+            http_client,
+            &reqwest_client,
+            777,
+            "sample-show",
+            temp_dir
+                .to_str()
+                .expect("temp dir path should be valid utf-8"),
+            Some(MetadataImageFormat::Tmdb),
+            &MultiProgress::new(),
+        )
+        .await
+        .expect("metadata workflow should reuse existing tmdb cover");
 
         let metadata_path = temp_dir.join("sample-show-metadata.json");
         let metadata_json = tokio::fs::read_to_string(&metadata_path)
@@ -834,6 +1121,19 @@ mod tests {
         (handle, url)
     }
 
+    fn png_test_image_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(width, height, |x, y| {
+            let red = (x % 255) as u8;
+            let green = (y % 255) as u8;
+            Rgba([red, green, 200, 255])
+        }));
+        let mut buffer = Cursor::new(Vec::new());
+        image
+            .write_to(&mut buffer, ImageFormat::Png)
+            .expect("test PNG should encode");
+        buffer.into_inner()
+    }
+
     fn unique_test_directory(prefix: &str) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -856,7 +1156,8 @@ mod tests {
     #[test]
     fn test_should_sort_entries_by_season_then_episode_number() {
         // Create test entries with various combinations of seasons and episode numbers
-        let mut entries = [MetadataOutputEntry {
+        let mut entries = [
+            MetadataOutputEntry {
                 title: Some("S1E3".to_string()),
                 description: None,
                 duration: None,
@@ -905,36 +1206,35 @@ mod tests {
                 season: Some("2a Temporada".to_string()),
                 episode_number_within_season: Some(1),
                 cover_path: None,
-            }];
+            },
+        ];
 
         // Apply the sorting logic from the metadata writing function
-        entries.sort_by(|a, b| {
-            match (&a.season, &b.season) {
-                (Some(season_a), Some(season_b)) => {
-                    let num_a = extract_season_number(season_a);
-                    let num_b = extract_season_number(season_b);
+        entries.sort_by(|a, b| match (&a.season, &b.season) {
+            (Some(season_a), Some(season_b)) => {
+                let num_a = extract_season_number(season_a);
+                let num_b = extract_season_number(season_b);
 
-                    match (num_a, num_b) {
-                        (Some(a_num), Some(b_num)) => match a_num.cmp(&b_num) {
-                            std::cmp::Ordering::Equal => {
-                                a.episode_number_within_season.cmp(&b.episode_number_within_season)
-                            }
-                            ordering => ordering,
-                        },
-                        _ => {
-                            match season_a.cmp(season_b) {
-                                std::cmp::Ordering::Equal => {
-                                    a.episode_number_within_season.cmp(&b.episode_number_within_season)
-                                }
-                                ordering => ordering,
-                            }
-                        }
-                    }
+                match (num_a, num_b) {
+                    (Some(a_num), Some(b_num)) => match a_num.cmp(&b_num) {
+                        std::cmp::Ordering::Equal => a
+                            .episode_number_within_season
+                            .cmp(&b.episode_number_within_season),
+                        ordering => ordering,
+                    },
+                    _ => match season_a.cmp(season_b) {
+                        std::cmp::Ordering::Equal => a
+                            .episode_number_within_season
+                            .cmp(&b.episode_number_within_season),
+                        ordering => ordering,
+                    },
                 }
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (None, None) => a.episode_number_within_season.cmp(&b.episode_number_within_season),
             }
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => a
+                .episode_number_within_season
+                .cmp(&b.episode_number_within_season),
         });
 
         // Verify the sort order
@@ -945,4 +1245,3 @@ mod tests {
         assert_eq!(entries[4].title.as_deref(), Some("S2E2"));
     }
 }
-

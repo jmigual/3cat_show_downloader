@@ -197,8 +197,12 @@ async fn run_download(args: DownloadArgs, multi_progress: MultiProgress) -> anyh
 
 #[instrument(skip_all)]
 async fn run_metadata(args: MetadataArgs, multi_progress: MultiProgress) -> anyhow::Result<()> {
+    let MetadataArgs {
+        target,
+        image_format,
+    } = args;
     let http_client = http_client::http_client();
-    let media = media_resolver::get_media_id(&args.target.slug).await?;
+    let media = media_resolver::get_media_id(&target.slug).await?;
 
     let tv_show_id = match media {
         MediaType::TvShow(id) => id,
@@ -212,8 +216,9 @@ async fn run_metadata(args: MetadataArgs, multi_progress: MultiProgress) -> anyh
     metadata::write_tv_show_metadata(
         http_client,
         tv_show_id,
-        &args.target.slug,
-        &args.target.directory,
+        &target.slug,
+        &target.directory,
+        image_format,
         &multi_progress,
     )
     .await
