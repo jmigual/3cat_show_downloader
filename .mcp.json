@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "C:\\Users\\joan.marce\\scoop\\persist\\nvm\\nodejs\\v22.13.1\\node.exe",
+      "args": [
+        "C:\\Users\\joan.marce\\.playwright-mcp\\node_modules\\@playwright\\mcp\\cli.js",
+        "--browser",
+        "chrome"
+      ]
+    }
+  }
+}
